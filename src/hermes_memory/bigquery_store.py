@@ -136,18 +136,29 @@ def insert_memory(
     if client is None:
         print(f"[mock] insert_memory: {mem_id} fact={fact[:60]} scope={scope}")
         return {"memory_id": mem_id, "fact": fact, "scope": scope}
-    # Use DML INSERT (reliable vs streaming insert eventual-consistency quirks)
+    # Parameterized query — string concatenation SQL breaks on newlines,
+    # quotes, and other special characters in arbitrary fact text.
     import json as _json
-    # Escape single quotes for SQL string literal
-    safe_fact = fact.replace("'", "\\'")
-    safe_scope = _json.dumps(scope).replace("'", "\\'")
-    safe_meta = _json.dumps(metadata).replace("'", "\\'") if metadata else None
-    meta_expr = f"JSON '{safe_meta}'" if safe_meta else "NULL"
+    from google.cloud import bigquery as _bq
+
     table = f"`{cfg.project}.{cfg.bq_dataset}.memories`"
     sql = f"""INSERT INTO {table} (memory_id, fact, scope, user_id, agent_name, source, session_name, metadata, created_at, updated_at, expires_at)
-    VALUES ('{mem_id}', '{safe_fact}', JSON '{safe_scope}', '{scope.get('user_id','')}', '{scope.get('agent_name','')}', '{source}', {f"'{session_name}'" if session_name else 'NULL'}, {meta_expr}, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL {cfg.ttl_days} DAY))"""
+    VALUES (@memory_id, @fact, PARSE_JSON(@scope), @user_id, @agent_name, @source, @session_name, PARSE_JSON(@metadata), CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL @ttl_days DAY))"""
+    job_config = _bq.QueryJobConfig(
+        query_parameters=[
+            _bq.ScalarQueryParameter("memory_id", "STRING", mem_id),
+            _bq.ScalarQueryParameter("fact", "STRING", fact),
+            _bq.ScalarQueryParameter("scope", "STRING", _json.dumps(scope)),
+            _bq.ScalarQueryParameter("user_id", "STRING", scope.get("user_id", "")),
+            _bq.ScalarQueryParameter("agent_name", "STRING", scope.get("agent_name", "")),
+            _bq.ScalarQueryParameter("source", "STRING", source),
+            _bq.ScalarQueryParameter("session_name", "STRING", session_name),
+            _bq.ScalarQueryParameter("metadata", "STRING", _json.dumps(metadata) if metadata else "null"),
+            _bq.ScalarQueryParameter("ttl_days", "INT64", cfg.ttl_days),
+        ]
+    )
     try:
-        client.query(sql).result()
+        client.query(sql, job_config=job_config).result()
         print(f"Inserted memory {mem_id}")
     except Exception as e:
         print(f"BigQuery insert failed: {e}")
@@ -164,13 +175,23 @@ def insert_session(session_name: str, user_id: str, events: list[dict], cfg: Her
         print(f"[mock] insert_session: {session_name} events={len(events)}")
         return {"session_name": session_name, "session_id": session_id, "user_id": user_id}
     import json as _json
-    safe_events = _json.dumps(events).replace("'", "\\'")
-    agent_expr = f"'{agent_name}'" if agent_name else "NULL"
+    from google.cloud import bigquery as _bq
+
     table = f"`{cfg.project}.{cfg.bq_dataset}.sessions`"
     sql = f"""INSERT INTO {table} (session_name, session_id, user_id, agent_name, events, event_count, created_at, updated_at)
-    VALUES ('{session_name}', '{session_id}', '{user_id}', {agent_expr}, JSON '{safe_events}', {len(events)}, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())"""
+    VALUES (@session_name, @session_id, @user_id, @agent_name, PARSE_JSON(@events), @event_count, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())"""
+    job_config = _bq.QueryJobConfig(
+        query_parameters=[
+            _bq.ScalarQueryParameter("session_name", "STRING", session_name),
+            _bq.ScalarQueryParameter("session_id", "STRING", session_id),
+            _bq.ScalarQueryParameter("user_id", "STRING", user_id),
+            _bq.ScalarQueryParameter("agent_name", "STRING", agent_name),
+            _bq.ScalarQueryParameter("events", "STRING", _json.dumps(events)),
+            _bq.ScalarQueryParameter("event_count", "INT64", len(events)),
+        ]
+    )
     try:
-        client.query(sql).result()
+        client.query(sql, job_config=job_config).result()
         print(f"Inserted session {session_name}")
     except Exception as e:
         print(f"BigQuery session insert failed: {e}")
