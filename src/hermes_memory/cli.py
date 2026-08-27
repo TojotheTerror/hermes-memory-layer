@@ -122,5 +122,68 @@ def seed(user_id, agent_name, dry_run):
     click.echo(f"\nSeeded {written}/{len(new_facts)} new facts for scope user_id={user_id}, agent_name={agent_name}")
 
 
+@main.command("ingest-obsidian")
+@click.option("--user", "user_id", required=True, help="user_id scope")
+@click.option("--agent", "agent_name", default="hermes", help="agent_name scope")
+@click.option("--vault", "vaults", multiple=True, help="Vault path(s); repeatable. Default = canonical set")
+@click.option("--min-chars", default=200, type=int, help="Skip notes shorter than this after stripping frontmatter")
+@click.option("--batch-chars", default=6000, type=int, help="Approx chars per Memory Bank generate() call")
+@click.option("--limit", default=None, type=int, help="Cap number of new/changed notes processed (testing)")
+@click.option("--dry-run", is_flag=True, help="Preview batches without writing")
+def ingest_obsidian(user_id, agent_name, vaults, min_chars, batch_chars, limit, dry_run):
+    """Ingest Obsidian vault notes into Memory Bank via real Gemini extraction (deduped by content hash)."""
+    from .hermes_bridge import (
+        DEFAULT_OBSIDIAN_VAULTS,
+        batch_notes,
+        discover_obsidian_notes,
+        _load_obsidian_manifest,
+        _save_obsidian_manifest,
+    )
+    from .memory_bank import generate_from_contents
+
+    vault_list = list(vaults) if vaults else DEFAULT_OBSIDIAN_VAULTS
+    click.echo(f"Scanning vaults:\n  " + "\n  ".join(vault_list))
+    notes = discover_obsidian_notes(vault_list, min_chars=min_chars)
+    click.echo(f"Found {len(notes)} substantive notes (>= {min_chars} chars, config/trash dirs excluded)")
+
+    manifest = _load_obsidian_manifest()
+    new_notes = [n for n in notes if manifest.get(n["path"]) != n["hash"]]
+    click.echo(f"{len(new_notes)} new/changed, {len(notes) - len(new_notes)} already ingested (unchanged)")
+
+    if limit:
+        new_notes = new_notes[:limit]
+        click.echo(f"Limiting this run to first {limit} notes")
+
+    batches = batch_notes(new_notes, batch_chars=batch_chars)
+    click.echo(f"Grouped into {len(batches)} batch(es) (~{batch_chars} chars each -> ~{len(batches)} Memory Bank generate calls)")
+
+    if dry_run:
+        for i, b in enumerate(batches):
+            click.echo(f"  [dry-run] batch {i + 1}/{len(batches)}: {len(b)} notes -> {[n['rel'] for n in b]}")
+        return
+
+    bridge = HermesBridge()
+    scope = {"user_id": user_id, "agent_name": agent_name}
+    ingested_notes = 0
+    failed_batches = 0
+    for i, b in enumerate(batches):
+        texts = [f"## {n['rel']} (vault: {__import__('pathlib').Path(n['vault']).name})\n\n{n['body']}" for n in b]
+        try:
+            generate_from_contents(bridge.memory_bank_name, texts, scope, cfg=bridge.cfg)
+            for n in b:
+                manifest[n["path"]] = n["hash"]
+            ingested_notes += len(b)
+            click.echo(f"  [OK] batch {i + 1}/{len(batches)}: {len(b)} notes")
+        except Exception as e:
+            failed_batches += 1
+            click.echo(f"  [FAIL] batch {i + 1}/{len(batches)}: {e}")
+        _save_obsidian_manifest(manifest)  # save progress after every batch so interrupts don't lose state
+
+    click.echo(
+        f"\nIngested {ingested_notes}/{len(new_notes)} notes across {len(batches) - failed_batches}/{len(batches)} "
+        f"successful batches for scope user_id={user_id}, agent_name={agent_name}"
+    )
+
+
 if __name__ == "__main__":
     main()

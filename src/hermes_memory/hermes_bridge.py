@@ -19,6 +19,91 @@ def _memories_dir() -> Path:
     return Path.home() / ".hermes" / "memories"
 
 
+def _obsidian_manifest_path() -> Path:
+    return _memories_dir() / "obsidian_ingest_manifest.json"
+
+
+def _load_obsidian_manifest() -> dict:
+    p = _obsidian_manifest_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_obsidian_manifest(manifest: dict) -> None:
+    p = _obsidian_manifest_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+DEFAULT_OBSIDIAN_VAULTS = [
+    "~/Vaults/Fully Experimental",
+    "~/Vaults/Hermes_Agent",
+    "~/Vaults/Passthrough",
+    "~/Documents/Thoughtseize",
+]
+
+_SKIP_DIR_MARKERS = (".obsidian", ".trash", ".git")
+
+
+def _strip_frontmatter(text: str) -> str:
+    if text.startswith("---\n"):
+        end = text.find("\n---", 4)
+        if end != -1:
+            return text[end + 4:].lstrip("\n")
+    return text
+
+
+def discover_obsidian_notes(vault_paths: list[str], min_chars: int = 200) -> list[dict]:
+    """Walk vaults, skip config/trash dirs and sub-min-chars stub notes."""
+    import hashlib
+
+    notes: list[dict] = []
+    for vp_raw in vault_paths:
+        vp = Path(vp_raw).expanduser()
+        if not vp.exists():
+            continue
+        for f in vp.rglob("*.md"):
+            path_str = str(f)
+            if any(f"/{marker}/" in path_str or path_str.endswith(f"/{marker}") for marker in _SKIP_DIR_MARKERS):
+                continue
+            try:
+                raw = f.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            body = _strip_frontmatter(raw).strip()
+            if len(body) < min_chars:
+                continue
+            h = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            try:
+                rel = str(f.relative_to(vp))
+            except ValueError:
+                rel = f.name
+            notes.append({"path": path_str, "vault": str(vp), "rel": rel, "hash": h, "body": body})
+    return notes
+
+
+def batch_notes(notes: list[dict], batch_chars: int = 6000) -> list[list[dict]]:
+    """Group notes into batches under an approx char budget per Memory Bank generate() call."""
+    batches: list[list[dict]] = []
+    cur: list[dict] = []
+    cur_len = 0
+    for n in notes:
+        entry_len = len(n["rel"]) + len(n["vault"]) + len(n["body"]) + 32
+        if cur and cur_len + entry_len > batch_chars:
+            batches.append(cur)
+            cur = []
+            cur_len = 0
+        cur.append(n)
+        cur_len += entry_len
+    if cur:
+        batches.append(cur)
+    return batches
+
+
 def read_curated_memory_files() -> list[dict]:
     """Read the curated MEMORY.md / USER.md files (§-separated durable facts)."""
     out: list[dict] = []
