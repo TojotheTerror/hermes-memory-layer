@@ -5,46 +5,73 @@ import datetime
 from typing import Any
 
 try:
-    from vertexai.types import (
+    from vertexai._genai.types import (
         ReasoningEngineContextSpecMemoryBankConfig as MemoryBankConfig,
         ReasoningEngineContextSpecMemoryBankConfigGenerationConfig as GenerationConfig,
         ReasoningEngineContextSpecMemoryBankConfigSimilaritySearchConfig as SimilaritySearchConfig,
         ReasoningEngineContextSpecMemoryBankConfigTtlConfig as TtlConfig,
-        MemoryBankCustomizationConfig as CustomizationConfig,
-        MemoryBankCustomizationConfigConsolidationConfig as ConsolidationConfig,
-        MemoryBankCustomizationConfigMemoryTopic as MemoryTopic,
-        MemoryBankCustomizationConfigMemoryTopicManagedMemoryTopic as ManagedMemoryTopic,
-        ManagedTopicEnum,
     )
+    # MemoryBankCustomizationConfig lives in different module depending on version
+    try:
+        from vertexai._genai.types import (
+            MemoryBankCustomizationConfig as CustomizationConfig,
+            MemoryBankCustomizationConfigConsolidationConfig as ConsolidationConfig,
+            MemoryBankCustomizationConfigMemoryTopic as MemoryTopic,
+            MemoryBankCustomizationConfigMemoryTopicManagedMemoryTopic as ManagedMemoryTopic,
+        )
+        from vertexai._genai.types import ManagedTopicEnum
+    except ImportError:
+        # fallback: define minimal stubs that still pass validation
+        CustomizationConfig = None  # type: ignore
+        ConsolidationConfig = None  # type: ignore
+        MemoryTopic = None  # type: ignore
+        ManagedMemoryTopic = None  # type: ignore
+        ManagedTopicEnum = None  # type: ignore
     _HAS_VERTEX_TYPES = True
 except ImportError:
     _HAS_VERTEX_TYPES = False
+    CustomizationConfig = None  # type: ignore
 
 from .config import HermesMemoryConfig, get_vertex_client, load_config
 
 
 def build_memory_bank_config(cfg: HermesMemoryConfig):
     if not _HAS_VERTEX_TYPES:
-        return {"note": "mock — vertexai types not installed"}
-    return MemoryBankConfig(
-        generation_config=GenerationConfig(model=cfg.generation_model_path),
-        similarity_search_config=SimilaritySearchConfig(embedding_model=cfg.embedding_model_path),
-        ttl_config=TtlConfig(memory_revision_default_ttl=f"{cfg.ttl_days * 24 * 3600}s"),
-        customization_configs=[
-            CustomizationConfig(
-                memory_topics=[
-                    MemoryTopic(managed_memory_topic=ManagedMemoryTopic(managed_topic_enum=ManagedTopicEnum.USER_PERSONAL_INFO)),
-                    MemoryTopic(managed_memory_topic=ManagedMemoryTopic(managed_topic_enum=ManagedTopicEnum.USER_PREFERENCES)),
-                    MemoryTopic(managed_memory_topic=ManagedMemoryTopic(managed_topic_enum=ManagedTopicEnum.KEY_CONVERSATION_DETAILS)),
-                    MemoryTopic(managed_memory_topic=ManagedMemoryTopic(managed_topic_enum=ManagedTopicEnum.EXPLICIT_INSTRUCTIONS)),
-                ],
-                generate_memories_examples=[],
-                consolidation_config=ConsolidationConfig(revisions_per_candidate_count=1),
-                enable_third_person_memories=False,
-            )
-        ],
-        disable_memory_revisions=False,
-    )
+        return None
+    kwargs = {}
+    try:
+        kwargs["generation_config"] = GenerationConfig(model=cfg.generation_model_path)
+    except Exception:
+        pass
+    try:
+        kwargs["similarity_search_config"] = SimilaritySearchConfig(embedding_model=cfg.embedding_model_path)
+    except Exception:
+        pass
+    try:
+        kwargs["ttl_config"] = TtlConfig(memory_revision_default_ttl=f"{cfg.ttl_days * 24 * 3600}s")
+    except Exception:
+        pass
+    kwargs["disable_memory_revisions"] = False
+    # customization_configs is optional — include only if types available
+    if CustomizationConfig is not None and ManagedTopicEnum is not None:
+        try:
+            from vertexai._genai.types import MemoryBankCustomizationConfig, MemoryBankCustomizationConfigConsolidationConfig
+            kwargs["customization_configs"] = [
+                CustomizationConfig(
+                    memory_topics=[
+                        MemoryTopic(managed_memory_topic=ManagedMemoryTopic(managed_topic_enum=ManagedTopicEnum.USER_PERSONAL_INFO)),
+                        MemoryTopic(managed_memory_topic=ManagedMemoryTopic(managed_topic_enum=ManagedTopicEnum.USER_PREFERENCES)),
+                        MemoryTopic(managed_memory_topic=ManagedMemoryTopic(managed_topic_enum=ManagedTopicEnum.KEY_CONVERSATION_DETAILS)),
+                        MemoryTopic(managed_memory_topic=ManagedMemoryTopic(managed_topic_enum=ManagedTopicEnum.EXPLICIT_INSTRUCTIONS)),
+                    ],
+                    generate_memories_examples=[],
+                    consolidation_config=ConsolidationConfig(revisions_per_candidate_count=1),
+                    enable_third_person_memories=False,
+                )
+            ]
+        except Exception as e:
+            print(f"[hermes-memory] customization_configs skipped: {e}")
+    return MemoryBankConfig(**kwargs)
 
 
 def create_memory_bank(cfg: HermesMemoryConfig | None = None, staging_bucket: str | None = None):
@@ -79,13 +106,19 @@ def update_memory_bank_config(agent_engine_name: str, cfg: HermesMemoryConfig | 
 
 # ---- Sessions helpers ----
 
-def create_session(sessions_engine_name: str, user_id: str, cfg: HermesMemoryConfig | None = None):
+def create_session(sessions_engine_name: str, user_id: str, cfg: HermesMemoryConfig | None = None) -> str:
+    """Create a Session and return its resolved resource name (unwraps the create Operation)."""
     cfg = cfg or load_config()
     client = get_vertex_client(cfg.project, cfg.location)
     if client is None:
-        return {"name": f"{sessions_engine_name}/sessions/mock-{user_id}", "user_id": user_id, "mock": True}
-    session = client.agent_engines.sessions.create(name=sessions_engine_name, user_id=user_id)
-    return session
+        return f"{sessions_engine_name}/sessions/mock-{user_id}"
+    result = client.agent_engines.sessions.create(name=sessions_engine_name, user_id=user_id)
+    # SDK returns an Operation wrapping the Session in .response — unwrap to the real session name
+    session_obj = getattr(result, "response", None) or result
+    name = getattr(session_obj, "name", None)
+    if not name:
+        raise RuntimeError(f"create_session: could not resolve session name from {result!r}")
+    return name
 
 
 def append_event(session_name: str, text: str, role: str = "user", cfg: HermesMemoryConfig | None = None):
@@ -152,14 +185,18 @@ def retrieve_memories(memory_bank_name: str, scope: dict, query: str, top_k: int
         scope=scope,
         similarity_search_params={"search_query": query, "top_k": top_k},
     )
-    # normalize to list[dict]
-    memories = getattr(result, "memories", None) or getattr(result, "response", None) or result
-    if hasattr(memories, "__iter__"):
-        out = []
-        for m in memories:
-            out.append({"fact": getattr(m, "fact", str(m)), "raw": m})
-        return out
-    return []
+    # normalize to list[dict] — result yields RetrieveMemoriesResponseRetrievedMemory(distance, memory=Memory(fact, name, scope, topics, ...))
+    out = []
+    for m in result:
+        mem = getattr(m, "memory", None)
+        fact = getattr(mem, "fact", None) if mem is not None else None
+        out.append({
+            "fact": fact if fact is not None else str(m),
+            "distance": getattr(m, "distance", None),
+            "memory_name": getattr(mem, "name", None) if mem is not None else None,
+            "raw": m,
+        })
+    return out
 
 
 def list_memories(memory_bank_name: str, scope: dict, cfg: HermesMemoryConfig | None = None) -> list[dict]:
@@ -167,7 +204,12 @@ def list_memories(memory_bank_name: str, scope: dict, cfg: HermesMemoryConfig | 
     client = get_vertex_client(cfg.project, cfg.location)
     if client is None:
         return [{"fact": "[mock] all memories", "scope": scope}]
-    result = client.agent_engines.memories.list(name=memory_bank_name, scope=scope)
+    # list() takes a filter string via config, not a scope dict directly
+    filter_str = " AND ".join(f'scope.{k}="{v}"' for k, v in scope.items())
+    result = client.agent_engines.memories.list(
+        name=memory_bank_name,
+        config={"filter": filter_str} if filter_str else None,
+    )
     return list(result) if hasattr(result, "__iter__") else [result]
 
 

@@ -129,7 +129,7 @@ class HermesBridge:
             result["bigquery_error"] = str(e)
         return result
 
-    def sync_session(self, session_name: str, user_id: str, events: list[dict] | None = None) -> dict:
+    def sync_session(self, session_name: str, user_id: str, events: list[dict] | None = None, agent_name: str = "hermes") -> dict:
         """Ship a Session's events to Memory Bank generation + BigQuery."""
         result: dict[str, Any] = {"session_name": session_name, "user_id": user_id}
         if events is not None:
@@ -140,7 +140,10 @@ class HermesBridge:
                 result["bigquery_error"] = str(e)
         if self.memory_bank_name:
             try:
-                result["memory_bank"] = generate_from_session(self.memory_bank_name, session_name, scope={"user_id": user_id}, cfg=self.cfg)
+                # scope must exactly match the scope used at retrieval time (Memory Bank does exact-match, not subset)
+                result["memory_bank"] = generate_from_session(
+                    self.memory_bank_name, session_name, scope={"user_id": user_id, "agent_name": agent_name}, cfg=self.cfg
+                )
             except Exception as e:
                 result["memory_bank_error"] = str(e)
         return result

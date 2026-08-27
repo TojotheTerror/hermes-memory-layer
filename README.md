@@ -6,7 +6,7 @@ Persistent, scoped long-term memory for the Hermes Agent fleet (Caladan / Arcanu
 ```
 Hermes Agent (local, Lemonade, SQLite) ──┐
                                          ├──► Agent Platform Sessions ──► Memory Bank
-                                         │         (AppendEvent)            (gemini-3.5-flash extraction
+                                         │         (AppendEvent)            (gemini-2.5-flash extraction
 Hermes fleet probes                      │                                   text-embedding-005 search)
 (reflex + reasoner, 0-token Go)          │                                    scope {user_id, agent_name}
                                          │
@@ -80,7 +80,7 @@ Vector search: `VECTOR_SEARCH(TABLE hermes_memory.memories, 'embedding', (SELECT
 
 - Memory Bank: **$0.25 / 1,000 stored memories** (generation billed as Gemini + embeddings)
 - BigQuery: on-demand $6.25/TB scanned, storage $0.02/GB/mo — dataset is tiny (<100 MB)
-- Generation model: `gemini-3.5-flash` (configurable), Embedding: `text-embedding-005`
+- Generation model: `gemini-2.5-flash` (configurable), Embedding: `text-embedding-005`
 
 ## Hermes bridge
 

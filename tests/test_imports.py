@@ -12,7 +12,7 @@ def test_config_paths():
     from hermes_memory.config import load_config
     cfg = load_config(project="test-proj", location="us-central1")
     assert "test-proj" in cfg.generation_model_path
-    assert "gemini-3.5-flash" in cfg.generation_model_path
+    assert "gemini-2.5-flash" in cfg.generation_model_path
 
 def test_bigquery_ddl_present():
     from hermes_memory.bigquery_store import DDL_MEMORIES, DDL_SESSIONS, DDL_REVISIONS
