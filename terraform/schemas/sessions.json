@@ -1,0 +1,12 @@
+{
+  "fields": [
+    {"name": "session_name", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "session_id", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "user_id", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "agent_name", "type": "STRING", "mode": "NULLABLE"},
+    {"name": "events", "type": "JSON", "mode": "NULLABLE"},
+    {"name": "event_count", "type": "INT64", "mode": "NULLABLE"},
+    {"name": "created_at", "type": "TIMESTAMP", "mode": "REQUIRED"},
+    {"name": "updated_at", "type": "TIMESTAMP", "mode": "REQUIRED"}
+  ]
+}

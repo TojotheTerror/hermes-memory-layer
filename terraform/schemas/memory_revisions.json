@@ -1,0 +1,11 @@
+{
+  "fields": [
+    {"name": "revision_name", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "memory_id", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "fact", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "extracted_memories", "type": "JSON", "mode": "NULLABLE"},
+    {"name": "scope", "type": "JSON", "mode": "NULLABLE"},
+    {"name": "created_at", "type": "TIMESTAMP", "mode": "REQUIRED"},
+    {"name": "ttl_expires_at", "type": "TIMESTAMP", "mode": "NULLABLE"}
+  ]
+}
