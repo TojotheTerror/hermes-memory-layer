@@ -15,6 +15,25 @@ def _local_db_path() -> Path:
     return Path.home() / ".hermes" / "hermes.db"
 
 
+def _memories_dir() -> Path:
+    return Path.home() / ".hermes" / "memories"
+
+
+def read_curated_memory_files() -> list[dict]:
+    """Read the curated MEMORY.md / USER.md files (§-separated durable facts)."""
+    out: list[dict] = []
+    for fname, kind in [("MEMORY.md", "memory"), ("USER.md", "user_profile")]:
+        path = _memories_dir() / fname
+        if not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        for chunk in text.split("§"):
+            fact = chunk.strip()
+            if fact:
+                out.append({"fact": fact, "source_file": fname, "kind": kind})
+    return out
+
+
 def read_local_memories(limit: int = 50) -> list[dict]:
     path = _local_db_path()
     if not path.exists():

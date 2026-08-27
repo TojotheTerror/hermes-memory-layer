@@ -71,5 +71,56 @@ def sync_local(limit):
     click.echo(f"\nFound {len(rows)} local memories.")
 
 
+@main.command("seed")
+@click.option("--user", "user_id", required=True, help="user_id scope")
+@click.option("--agent", "agent_name", default="hermes", help="agent_name scope")
+@click.option("--dry-run", is_flag=True, help="Preview without writing")
+def seed(user_id, agent_name, dry_run):
+    """Ingest curated MEMORY.md / USER.md facts into Memory Bank + BigQuery (deduped)."""
+    from .bigquery_store import query_memories_sql, _bq_client
+    from .hermes_bridge import read_curated_memory_files
+
+    facts = read_curated_memory_files()
+    click.echo(f"Found {len(facts)} curated facts in MEMORY.md / USER.md")
+
+    bridge = HermesBridge()
+
+    # dedupe against what's already in BigQuery for this scope
+    existing: set[str] = set()
+    try:
+        client = _bq_client(bridge.cfg)
+        if client is not None:
+            sql = query_memories_sql(user_id, limit=1000, cfg=bridge.cfg)
+            for r in client.query(sql).result():
+                existing.add(str(r["fact"]).strip().lower())
+    except Exception as e:
+        click.echo(f"[seed] warn: could not fetch existing facts for dedupe: {e}")
+
+    new_facts = [f for f in facts if f["fact"].strip().lower() not in existing]
+    click.echo(f"{len(new_facts)} new (not already in corpus), {len(facts) - len(new_facts)} already present")
+
+    if dry_run:
+        for f in new_facts:
+            click.echo(f"  [dry-run] would write ({f['kind']} / {f['source_file']}): {f['fact'][:80]}...")
+        return
+
+    written = 0
+    for f in new_facts:
+        result = bridge.explicit_remember(
+            user_id=user_id,
+            fact=f["fact"],
+            agent_name=agent_name,
+            metadata={"kind": f["kind"], "source_file": f["source_file"], "seed": True},
+        )
+        errs = {k: v for k, v in result.items() if k.endswith("_error")}
+        if errs:
+            click.echo(f"  [FAIL] {f['fact'][:60]}... -> {errs}")
+        else:
+            written += 1
+            click.echo(f"  [OK] {f['fact'][:60]}...")
+
+    click.echo(f"\nSeeded {written}/{len(new_facts)} new facts for scope user_id={user_id}, agent_name={agent_name}")
+
+
 if __name__ == "__main__":
     main()
