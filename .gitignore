@@ -5,3 +5,5 @@ dist/
 build/
 .terraform/
 *.tfstate*
+.env
+.pytest_cache/
