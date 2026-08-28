@@ -1,0 +1,7 @@
+name: gcp_memory_bank
+version: "1.0.0"
+description: "GCP Agent Platform Memory Bank + BigQuery — persistent memory via Vertex AI Memory Bank (semantic) and BigQuery (analytics/audit)."
+external_dependencies:
+  - name: hermes-memory-layer
+    install: "pip install -e ~/hermes-memory-layer"
+    check: "python -c 'import hermes_memory'"

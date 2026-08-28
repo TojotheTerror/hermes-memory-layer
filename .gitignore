@@ -7,3 +7,4 @@ build/
 *.tfstate*
 .env
 .pytest_cache/
+backups/
