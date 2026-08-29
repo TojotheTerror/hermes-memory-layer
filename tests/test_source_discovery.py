@@ -126,6 +126,53 @@ def test_missing_git_uses_static_fallback_with_warning(
     assert result.warnings == ("git check-ignore unavailable; static exclusions only",)
 
 
+@pytest.mark.parametrize(
+    ("policy", "for_apply"),
+    (
+        (SourcePolicy(include_patterns=("**",)), False),
+        (SourcePolicy(allow_all_approved=True), True),
+    ),
+)
+def test_worktree_git_metadata_file_is_rejected_without_disclosure(
+    tmp_path: Path, policy: SourcePolicy, for_apply: bool
+) -> None:
+    repository_root = tmp_path / "repository"
+    worktree_root = tmp_path / "linked-worktree"
+    subprocess.run(["git", "init", "-q", str(repository_root)], check=True)
+    _write(repository_root, "safe.md")
+    subprocess.run(["git", "-C", str(repository_root), "add", "safe.md"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository_root),
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "synthetic fixture",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository_root), "worktree", "add", "-qb", "linked", str(worktree_root)],
+        check=True,
+    )
+
+    result = discover_sources(worktree_root, policy, for_apply=for_apply)
+
+    assert result.relative_paths == ("safe.md",)
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        (".git", "default_excluded_directory"),
+    ]
+    assert vars(result.rejected[0]) == {
+        "path": ".git",
+        "rule": "default_excluded_directory",
+    }
+
+
 def test_symlink_that_escapes_root_is_rejected(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
@@ -138,6 +185,100 @@ def test_symlink_that_escapes_root_is_rejected(tmp_path: Path) -> None:
     assert [(item.path, item.rule) for item in result.rejected] == [
         ("escape.md", "symlink_escape"),
     ]
+
+
+def test_internal_symlink_target_must_match_include_allowlist(tmp_path: Path) -> None:
+    target = _write(tmp_path, "unapproved/notes.md")
+    (tmp_path / "approved").mkdir()
+    (tmp_path / "approved/alias.md").symlink_to(target)
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("approved/**",)))
+
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("approved/alias.md", "not_in_allowlist"),
+        ("unapproved/notes.md", "not_in_allowlist"),
+    ]
+
+
+def test_internal_symlink_target_must_not_match_explicit_exclude(tmp_path: Path) -> None:
+    target = _write(tmp_path, "blocked/notes.md")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/alias.md").symlink_to(target)
+
+    result = discover_sources(
+        tmp_path,
+        SourcePolicy(include_patterns=("**",), exclude_patterns=("blocked/**",)),
+    )
+
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("blocked/notes.md", "exclude_pattern"),
+        ("docs/alias.md", "exclude_pattern"),
+    ]
+
+
+@pytest.mark.parametrize("denied_directory", ("node_modules", ".git"))
+def test_internal_symlink_target_must_not_be_in_default_denied_directory(
+    tmp_path: Path, denied_directory: str
+) -> None:
+    target_relative_path = f"{denied_directory}/metadata.md"
+    target = _write(tmp_path, target_relative_path)
+    (tmp_path / "zz-safe").mkdir()
+    (tmp_path / "zz-safe/alias.md").symlink_to(target)
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("**",)))
+
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        (target_relative_path, "default_excluded_directory"),
+        ("zz-safe/alias.md", "default_excluded_directory"),
+    ]
+
+
+def test_internal_symlink_target_must_pass_secret_path_classification(tmp_path: Path) -> None:
+    target = _write(tmp_path, "config/secrets.json")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/reference.json").symlink_to(target)
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("**",)))
+
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("config/secrets.json", "secret_path"),
+        ("docs/reference.json", "secret_path"),
+    ]
+    assert vars(result.rejected[1]) == {"path": "docs/reference.json", "rule": "secret_path"}
+
+
+def test_internal_symlink_target_must_not_be_git_ignored(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    _write(tmp_path, ".gitignore", b"ignored/\n")
+    target = _write(tmp_path, "ignored/notes.md")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/alias.md").symlink_to(target)
+
+    result = discover_sources(
+        tmp_path,
+        SourcePolicy(include_patterns=("**",)),
+        repository=True,
+    )
+
+    assert result.relative_paths == (".gitignore",)
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("docs/alias.md", "git_ignored"),
+        ("ignored/notes.md", "git_ignored"),
+    ]
+
+
+def test_internal_symlink_is_allowed_when_alias_and_target_are_safe(tmp_path: Path) -> None:
+    target = _write(tmp_path, "docs/original.md")
+    (tmp_path / "docs/alias.md").symlink_to(target)
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("docs/**",)))
+
+    assert result.relative_paths == ("docs/alias.md", "docs/original.md")
+    assert result.rejected == ()
 
 
 def test_binary_file_is_rejected(tmp_path: Path) -> None:

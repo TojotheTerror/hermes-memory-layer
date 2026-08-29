@@ -272,6 +272,18 @@ def _path_category_rule(relative_path: str) -> str | None:
     return None
 
 
+def _static_path_rule(relative_path: str, policy: SourcePolicy) -> str | None:
+    if policy.include_patterns and not _matches(relative_path, policy.include_patterns):
+        return "not_in_allowlist"
+    if _matches(relative_path, policy.exclude_patterns):
+        return "exclude_pattern"
+    if relative_path == ".git" or any(
+        part.lower() in DEFAULT_EXCLUDED_DIRECTORIES for part in Path(relative_path).parts[:-1]
+    ):
+        return "default_excluded_directory"
+    return _path_category_rule(relative_path)
+
+
 def _looks_binary(content: bytes) -> bool:
     if b"\x00" in content:
         return True
@@ -349,23 +361,11 @@ def discover_sources(
         relative_path = path.relative_to(root_path).as_posix()
         if is_repository and relative_path.startswith(".git/"):
             continue
-        if active_policy.include_patterns and not _matches(
-            relative_path, active_policy.include_patterns
-        ):
-            rejected.append(RejectedSource(relative_path, "not_in_allowlist"))
+        alias_path_rule = _static_path_rule(relative_path, active_policy)
+        if alias_path_rule:
+            rejected.append(RejectedSource(relative_path, alias_path_rule))
             continue
-        if _matches(relative_path, active_policy.exclude_patterns):
-            rejected.append(RejectedSource(relative_path, "exclude_pattern"))
-            continue
-        if any(
-            part.lower() in DEFAULT_EXCLUDED_DIRECTORIES for part in Path(relative_path).parts[:-1]
-        ):
-            rejected.append(RejectedSource(relative_path, "default_excluded_directory"))
-            continue
-        path_rule = _path_category_rule(relative_path)
-        if path_rule:
-            rejected.append(RejectedSource(relative_path, path_rule))
-            continue
+        target_relative_path = relative_path
         if path.is_symlink():
             try:
                 target = path.resolve(strict=True)
@@ -374,6 +374,11 @@ def discover_sources(
                 continue
             if not target.is_relative_to(root_path):
                 rejected.append(RejectedSource(relative_path, "symlink_escape"))
+                continue
+            target_relative_path = target.relative_to(root_path).as_posix()
+            target_path_rule = _static_path_rule(target_relative_path, active_policy)
+            if target_path_rule:
+                rejected.append(RejectedSource(relative_path, target_path_rule))
                 continue
         if git_available:
             git_status = _git_ignore_status(root_path, relative_path)
@@ -386,6 +391,17 @@ def discover_sources(
             elif git_status == "error":
                 rejected.append(RejectedSource(relative_path, "detection_error"))
                 continue
+            if path.is_symlink() and git_available:
+                target_git_status = _git_ignore_status(root_path, target_relative_path)
+                if target_git_status == "ignored":
+                    rejected.append(RejectedSource(relative_path, "git_ignored"))
+                    continue
+                if target_git_status == "unavailable":
+                    warnings.append("git check-ignore unavailable; static exclusions only")
+                    git_available = False
+                elif target_git_status == "error":
+                    rejected.append(RejectedSource(relative_path, "detection_error"))
+                    continue
         try:
             if path.stat().st_size > active_policy.max_file_size_bytes:
                 rejected.append(RejectedSource(relative_path, "max_file_size"))
