@@ -4,7 +4,7 @@ import subprocess
 import pytest
 
 import hermes_memory.source_discovery as source_discovery
-from hermes_memory.source_discovery import SourcePolicy, discover_sources
+from hermes_memory.source_discovery import DiscoveredSource, SourcePolicy, discover_sources
 
 
 def _write(root: Path, relative_path: str, content: bytes = b"safe text") -> Path:
@@ -311,45 +311,97 @@ def test_internal_symlink_is_allowed_when_alias_and_target_are_safe(tmp_path: Pa
     assert result.rejected == ()
 
 
-def test_internal_symlink_swap_after_target_policy_check_does_not_read_outside(
+def test_alias_swap_after_validation_consumes_the_inspected_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "root"
     approved_content = b"approved internal content"
-    outside_content = b"outside body must never be inspected"
+    outside_content = b"outside body must never be consumed"
     target = _write(root, "docs/original.md", approved_content)
     alias = root / "docs/alias.md"
     alias.symlink_to(target)
     outside = _write(tmp_path, "outside.md", outside_content)
-    original_static_path_rule = source_discovery._static_path_rule
+    original_generated_content_rule = source_discovery._generated_content_rule
     inspected: list[bytes] = []
     swapped = False
 
-    def swap_after_target_policy_check(relative_path: str, policy: SourcePolicy) -> str | None:
+    def swap_alias_after_final_content_check(content: bytes) -> str | None:
         nonlocal swapped
-        rule = original_static_path_rule(relative_path, policy)
-        if relative_path == "docs/original.md" and not swapped:
+        inspected.append(content)
+        rule = original_generated_content_rule(content)
+        if not swapped:
             alias.unlink()
             alias.symlink_to(outside)
             swapped = True
         return rule
 
-    original_secret_content_rule = source_discovery._secret_content_rule
-
-    def record_inspected_content(content: bytes) -> str | None:
-        inspected.append(content)
-        return original_secret_content_rule(content)
-
-    monkeypatch.setattr(source_discovery, "_static_path_rule", swap_after_target_policy_check)
-    monkeypatch.setattr(source_discovery, "_secret_content_rule", record_inspected_content)
+    monkeypatch.setattr(
+        source_discovery,
+        "_generated_content_rule",
+        swap_alias_after_final_content_check,
+    )
 
     result = discover_sources(root, SourcePolicy(include_patterns=("docs/**",)))
 
     assert swapped
+    assert alias.read_bytes() == outside_content
     assert result.relative_paths == ("docs/alias.md", "docs/original.md")
+    assert isinstance(result.sources[0], DiscoveredSource)
+    assert result.sources[0].relative_path == "docs/alias.md"
+    assert result.sources[0].content == approved_content
     assert outside_content not in inspected
     assert inspected == [approved_content, approved_content]
     assert result.rejected == ()
+    assert approved_content.decode() not in repr(result)
+    assert outside_content.decode() not in repr(result)
+
+
+def test_parent_replacement_and_hardlink_identity_trick_cannot_change_consumed_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    approved_content = b"approved bytes inspected under policy"
+    outside_content = b"outside replacement must never be consumed"
+    target = _write(root, "docs/notes.md", approved_content)
+    approved_directory = root / "docs"
+    parked_directory = root / "parked-docs"
+    outside_directory = tmp_path / "outside"
+    outside_directory.mkdir()
+    outside_hardlink = outside_directory / "notes.md"
+    outside_hardlink.hardlink_to(target)
+    original_open = source_discovery.os.open
+    original_generated_content_rule = source_discovery._generated_content_rule
+    inspected: list[bytes] = []
+    replaced_parent = False
+
+    def replace_parent_with_directory_holding_same_inode(path: Path, flags: int) -> int:
+        nonlocal replaced_parent
+        if Path(path) == target and not replaced_parent:
+            approved_directory.rename(parked_directory)
+            approved_directory.symlink_to(outside_directory, target_is_directory=True)
+            replaced_parent = True
+        return original_open(path, flags)
+
+    def record_final_content_check(content: bytes) -> str | None:
+        inspected.append(content)
+        return original_generated_content_rule(content)
+
+    monkeypatch.setattr(
+        source_discovery.os, "open", replace_parent_with_directory_holding_same_inode
+    )
+    monkeypatch.setattr(source_discovery, "_generated_content_rule", record_final_content_check)
+
+    result = discover_sources(root, SourcePolicy(include_patterns=("docs/**",)))
+    outside_hardlink.unlink()
+    outside_hardlink.write_bytes(outside_content)
+
+    assert replaced_parent
+    assert (root / "docs/notes.md").read_bytes() == outside_content
+    assert result.relative_paths == ("docs/notes.md",)
+    assert result.sources[0].relative_path == "docs/notes.md"
+    assert inspected == [approved_content]
+    assert result.sources[0].content == inspected[0]
+    assert result.sources[0].content != outside_content
     assert outside_content.decode() not in repr(result)
 
 

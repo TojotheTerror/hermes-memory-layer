@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 import os
 from pathlib import Path
@@ -69,17 +69,25 @@ class RejectedSource:
 
 
 @dataclass(frozen=True)
+class DiscoveredSource:
+    """An approved source identity and the exact immutable bytes that passed policy."""
+
+    relative_path: str
+    content: bytes = field(repr=False)
+
+
+@dataclass(frozen=True)
 class DiscoveryResult:
-    """Accepted paths and safe rejection metadata in deterministic order."""
+    """Approved source snapshots and safe rejection metadata in deterministic order."""
 
     root: Path
-    sources: tuple[Path, ...]
+    sources: tuple[DiscoveredSource, ...]
     rejected: tuple[RejectedSource, ...]
     warnings: tuple[str, ...] = ()
 
     @property
     def relative_paths(self) -> tuple[str, ...]:
-        return tuple(path.relative_to(self.root).as_posix() for path in self.sources)
+        return tuple(source.relative_path for source in self.sources)
 
 
 def _matches(path: str, patterns: Iterable[str]) -> bool:
@@ -411,7 +419,7 @@ def discover_sources(
     auto_repository = git_metadata.is_file() or (git_metadata / "HEAD").is_file()
     is_repository = repository if repository is not None else auto_repository
     git_available = is_repository
-    accepted: list[Path] = []
+    accepted: list[DiscoveredSource] = []
     rejected: list[RejectedSource] = []
     warnings: list[str] = []
 
@@ -482,6 +490,6 @@ def discover_sources(
         if secret_rule:
             rejected.append(RejectedSource(relative_path, secret_rule))
             continue
-        accepted.append(path)
+        accepted.append(DiscoveredSource(relative_path=relative_path, content=content))
 
     return DiscoveryResult(root_path, tuple(accepted), tuple(rejected), tuple(warnings))
