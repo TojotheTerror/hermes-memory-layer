@@ -298,6 +298,11 @@ VALUES
     return True
 
 
+def _validate_embedding_dimensions(value: object) -> None:
+    if type(value) is not int or value <= 0:
+        raise ValueError("embedding dimensions must be a positive integer")
+
+
 def insert_chunks(
     chunks: list[dict],
     *,
@@ -310,12 +315,15 @@ def insert_chunks(
     """Insert inactive chunks using chunk identities as retry-stable insert IDs."""
     if not chunks:
         return 0
+    _validate_embedding_dimensions(embedding_dimensions)
     cfg = cfg or load_config()
     _validate_ddl_identifiers(cfg)
     for chunk in chunks:
+        declared_dimensions = chunk.get("embedding_dimensions")
+        _validate_embedding_dimensions(declared_dimensions)
         if chunk.get("embedding_model") != embedding_model:
             raise ValueError(f"chunk {chunk.get('chunk_id')!r} has wrong embedding model")
-        if chunk.get("embedding_dimensions") != embedding_dimensions:
+        if declared_dimensions != embedding_dimensions:
             raise ValueError(f"chunk {chunk.get('chunk_id')!r} has wrong embedding dimensions")
         embedding = chunk.get("embedding")
         if embedding is None or len(embedding) != embedding_dimensions:

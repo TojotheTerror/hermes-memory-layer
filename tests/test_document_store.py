@@ -495,6 +495,109 @@ def test_insert_chunks_uses_chunk_ids_as_deterministic_insert_ids(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("invalid_dimensions", "embedding"),
+    [
+        pytest.param(True, (0.1,), id="boolean"),
+        pytest.param(1.0, (0.1,), id="float"),
+        pytest.param("3", (0.1, 0.2, 0.3), id="numeric-string"),
+        pytest.param(b"3", (0.1, 0.2, 0.3), id="bytes"),
+        pytest.param(None, (0.1, 0.2, 0.3), id="none"),
+        pytest.param(0, (), id="zero"),
+        pytest.param(-1, (), id="negative"),
+    ],
+)
+def test_insert_chunks_rejects_invalid_expected_dimensions_before_client_acquisition(
+    monkeypatch, invalid_dimensions, embedding
+):
+    client_acquisitions = []
+    client = _StoreFakeClient()
+
+    def acquire_client(cfg):
+        client_acquisitions.append(cfg)
+        return client
+
+    monkeypatch.setattr(bigquery_store, "_bq_client", acquire_client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+    chunk = _chunk(
+        text="private-source-content",
+        embedding=embedding,
+        embedding_dimensions=invalid_dimensions,
+    )
+
+    with pytest.raises(ValueError, match="embedding dimensions") as exc_info:
+        bigquery_store.insert_chunks(
+            [chunk],
+            user_id="private-user-credential",
+            agent_name="private-agent-credential",
+            embedding_model="test-embedding-model",
+            embedding_dimensions=invalid_dimensions,
+            cfg=cfg,
+        )
+
+    error = str(exc_info.value)
+    assert "private-source-content" not in error
+    assert repr(embedding) not in error
+    assert "private-user-credential" not in error
+    assert "private-agent-credential" not in error
+    assert client_acquisitions == []
+    assert client.queries == []
+    assert client.inserts == []
+
+
+@pytest.mark.parametrize(
+    "invalid_dimensions",
+    [
+        pytest.param(True, id="boolean"),
+        pytest.param(1.0, id="float"),
+        pytest.param("1", id="numeric-string"),
+        pytest.param(b"1", id="bytes"),
+        pytest.param(None, id="none"),
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+    ],
+)
+def test_insert_chunks_rejects_invalid_declared_dimensions_before_other_checks_or_client(
+    monkeypatch, invalid_dimensions
+):
+    client_acquisitions = []
+    client = _StoreFakeClient()
+
+    def acquire_client(cfg):
+        client_acquisitions.append(cfg)
+        return client
+
+    monkeypatch.setattr(bigquery_store, "_bq_client", acquire_client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+    embedding = (0.123456789,)
+    chunk = _chunk(
+        text="private-source-content",
+        embedding=embedding,
+        embedding_model="private-model-credential",
+        embedding_dimensions=invalid_dimensions,
+    )
+
+    with pytest.raises(ValueError, match="embedding dimensions") as exc_info:
+        bigquery_store.insert_chunks(
+            [chunk],
+            user_id="private-user-credential",
+            agent_name="private-agent-credential",
+            embedding_model="test-embedding-model",
+            embedding_dimensions=1,
+            cfg=cfg,
+        )
+
+    error = str(exc_info.value)
+    assert "private-source-content" not in error
+    assert repr(embedding) not in error
+    assert "private-model-credential" not in error
+    assert "private-user-credential" not in error
+    assert "private-agent-credential" not in error
+    assert client_acquisitions == []
+    assert client.queries == []
+    assert client.inserts == []
+
+
+@pytest.mark.parametrize(
     "chunk",
     [
         pytest.param(_chunk(embedding_model="wrong-model"), id="model"),
