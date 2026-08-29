@@ -18,7 +18,9 @@ ContentKind = Literal["markdown", "code", "text"]
 def _deep_freeze(value: Any) -> Any:
     if isinstance(value, Mapping):
         return MappingProxyType({key: _deep_freeze(item) for key, item in value.items()})
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return tuple(_deep_freeze(item) for item in value)
     if isinstance(value, Set):
         return frozenset(_deep_freeze(item) for item in value)

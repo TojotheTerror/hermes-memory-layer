@@ -85,6 +85,30 @@ def test_metadata_rejects_direct_mutation(record_factory):
         record.metadata["owner"] = "changed"
 
 
+def test_source_document_freezes_bytearray_metadata_without_caller_aliases():
+    buffer = bytearray(b"source")
+    source = _source_with_metadata({"buffer": buffer})
+
+    buffer[0] = ord("S")
+
+    assert source.metadata["buffer"] == b"source"
+    with pytest.raises(TypeError):
+        source.metadata["buffer"][0] = ord("S")
+    assert isinstance(source.metadata["buffer"], bytes)
+
+
+def test_document_chunk_freezes_bytearray_metadata_without_caller_aliases():
+    buffer = bytearray(b"chunk")
+    chunk = _chunk_with_metadata({"buffer": buffer})
+
+    buffer[0] = ord("C")
+
+    assert chunk.metadata["buffer"] == b"chunk"
+    with pytest.raises(TypeError):
+        chunk.metadata["buffer"][0] = ord("C")
+    assert isinstance(chunk.metadata["buffer"], bytes)
+
+
 def test_document_identity_and_line_ranges_are_deterministic():
     text = FIXTURE.read_text()
     lines = text.splitlines()
