@@ -68,6 +68,7 @@ class BlockingModels:
     def __init__(self):
         self.lock = Lock()
         self.release = Event()
+        self.one_started = Event()
         self.two_started = Event()
         self.four_started = Event()
         self.active = 0
@@ -77,6 +78,7 @@ class BlockingModels:
         with self.lock:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
+            self.one_started.set()
             if self.active >= 2:
                 self.two_started.set()
             if self.active >= 4:
@@ -133,6 +135,34 @@ class SubmissionTrackingIterable:
             if self.yielded > self.allowed_before_release and not self.release.is_set():
                 self.eager_submission.set()
             yield str(value)
+
+
+class OutstandingTrackingExecutor:
+    def __init__(self, delegate, limit):
+        self.delegate = delegate
+        self.limit = limit
+        self.lock = Lock()
+        self.over_limit = Event()
+        self.outstanding = 0
+        self.max_outstanding = 0
+
+    def submit(self, function, *args, **kwargs):
+        with self.lock:
+            self.outstanding += 1
+            self.max_outstanding = max(self.max_outstanding, self.outstanding)
+            if self.outstanding > self.limit:
+                self.over_limit.set()
+        try:
+            future = self.delegate.submit(function, *args, **kwargs)
+        except BaseException:
+            self._completed()
+            raise
+        future.add_done_callback(lambda _future: self._completed())
+        return future
+
+    def _completed(self):
+        with self.lock:
+            self.outstanding -= 1
 
 
 def embedding_response(values, *, token_count=None, truncated=None, billable_count=None):
@@ -363,12 +393,61 @@ def test_embed_does_not_retry_invalid_auth_or_other_nontransient_api_errors(stat
         sleep=delays.append,
     )
 
-    with pytest.raises(error_type) as raised:
+    with pytest.raises(RuntimeError, match="embedding request failed") as raised:
         gateway.embed("must not retry")
 
-    assert raised.value is failure
+    assert type(raised.value).__name__ == "EmbeddingRequestError"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
     assert len(client.models.calls) == 1
     assert delays == []
+
+
+@pytest.mark.parametrize(
+    ("status_code", "status", "expected_calls", "expected_delays"),
+    [
+        (403, "PERMISSION_DENIED", 1, []),
+        (503, "UNAVAILABLE", 2, [0.25]),
+    ],
+)
+def test_embed_sanitizes_api_errors_after_internal_retry_classification(
+    status_code, status, expected_calls, expected_delays
+):
+    sensitive_fragments = (
+        "private source text",
+        "credential=ya29.fake-secret",
+        "vector=[0.123,0.456]",
+        "https://vertex.example/v1/private-endpoint",
+        "RAW_PROVIDER_DIAGNOSTIC",
+    )
+    raw_message = " | ".join(sensitive_fragments)
+    error_type = errors.ClientError if status_code < 500 else errors.ServerError
+    failures = [
+        error_type(status_code, {"error": {"status": status, "message": raw_message}})
+        for _ in range(expected_calls)
+    ]
+    client = sequenced_client(failures)
+    delays = []
+    gateway = VertexEmbeddingClient(
+        client=client,
+        dimensions=1,
+        max_attempts=2,
+        initial_retry_delay=0.25,
+        sleep=delays.append,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        gateway.embed("private source text")
+
+    assert type(raised.value).__name__ == "EmbeddingRequestError"
+    assert str(raised.value) == "embedding request failed"
+    assert raised.value.args == ("embedding request failed",)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    exposed = f"{raised.value!s} {raised.value!r} {raised.value.args!r}"
+    assert all(fragment not in exposed for fragment in sensitive_fragments)
+    assert len(client.models.calls) == expected_calls
+    assert delays == expected_delays
 
 
 def test_embed_does_not_retry_non_api_exceptions():
@@ -495,6 +574,27 @@ def test_embed_many_never_exceeds_configured_concurrency():
     assert [result.values for result in results] == [(1.0,), (2.0,), (3.0,), (4.0,)]
 
 
+def test_direct_embed_calls_share_the_instance_concurrency_bound():
+    models = BlockingModels()
+    gateway = VertexEmbeddingClient(
+        client=SimpleNamespace(models=models),
+        dimensions=1,
+        concurrency=2,
+    )
+
+    with ThreadPoolExecutor(max_workers=6) as callers:
+        futures = [callers.submit(gateway.embed, str(value)) for value in range(6)]
+        assert models.two_started.wait(timeout=1)
+        try:
+            assert not models.four_started.wait(timeout=0.1)
+        finally:
+            models.release.set()
+        results = [future.result(timeout=1) for future in futures]
+
+    assert models.max_active == 2
+    assert sorted(result.values for result in results) == [(float(value),) for value in range(6)]
+
+
 def test_concurrent_embed_many_calls_share_the_instance_concurrency_bound():
     models = BlockingModels()
     gateway = VertexEmbeddingClient(
@@ -515,6 +615,38 @@ def test_concurrent_embed_many_calls_share_the_instance_concurrency_bound():
 
     assert models.max_active == 2
     assert sorted(result.values for result in results) == [(1.0,), (2.0,), (3.0,), (4.0,)]
+
+
+def test_combined_callers_share_one_bounded_submission_pool_without_deadlock(monkeypatch):
+    models = BlockingModels()
+    gateway = VertexEmbeddingClient(
+        client=SimpleNamespace(models=models),
+        dimensions=1,
+        concurrency=2,
+    )
+    tracker = OutstandingTrackingExecutor(gateway._executor, limit=2)
+    monkeypatch.setattr(gateway, "_executor", tracker)
+    batch_inputs = [
+        [str(batch_index * 2 + 1), str(batch_index * 2 + 2)] for batch_index in range(8)
+    ]
+
+    with ThreadPoolExecutor(max_workers=9) as callers:
+        direct = callers.submit(gateway.embed, "100")
+        assert models.one_started.wait(timeout=1)
+        batches = [callers.submit(gateway.embed_many, texts) for texts in batch_inputs]
+        assert models.two_started.wait(timeout=1)
+        try:
+            assert not tracker.over_limit.wait(timeout=0.1)
+        finally:
+            models.release.set()
+        direct_result = direct.result(timeout=2)
+        batch_results = [future.result(timeout=2) for future in batches]
+
+    assert tracker.max_outstanding <= 2
+    assert direct_result.values == (100.0,)
+    assert [[result.values for result in results] for results in batch_results] == [
+        [(float(text),) for text in texts] for texts in batch_inputs
+    ]
 
 
 def test_embed_many_keeps_a_bounded_submission_window_for_large_iterables():

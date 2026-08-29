@@ -8,7 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from hashlib import sha256
 from math import isfinite
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 from time import sleep as default_sleep
 from typing import Any, Callable
 
@@ -16,6 +16,11 @@ from google.genai import errors, types
 
 
 _TRANSIENT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+_SAFE_REQUEST_ERROR = "embedding request failed"
+
+
+class EmbeddingRequestError(RuntimeError):
+    """A provider-independent embedding request failure."""
 
 
 @dataclass(frozen=True)
@@ -78,6 +83,7 @@ class VertexEmbeddingClient:
         self._initial_retry_delay = initial_retry_delay
         self._sleep = sleep
         self._executor = ThreadPoolExecutor(max_workers=concurrency)
+        self._admission = BoundedSemaphore(concurrency)
         self._cache: dict[tuple[str, int, str, str], EmbeddingResult] = {}
         self._inflight: dict[tuple[str, int, str, str], Future[EmbeddingResult]] = {}
         self._cache_lock = Lock()
@@ -95,32 +101,64 @@ class VertexEmbeddingClient:
         return self._config.task_type
 
     def embed(self, text: str) -> EmbeddingResult:
+        return self._submit(text).result()
+
+    def _submit(self, text: str) -> Future[EmbeddingResult]:
         cache_key = (self.model, self.dimensions, self.task_type, sha256(text.encode()).hexdigest())
         with self._cache_lock:
             cached = self._cache.get(cache_key)
             if cached is not None:
-                return cached
+                completed: Future[EmbeddingResult] = Future()
+                completed.set_result(cached)
+                return completed
             pending = self._inflight.get(cache_key)
-            owns_request = pending is None
-            if owns_request:
-                pending = Future()
-                self._inflight[cache_key] = pending
-        if not owns_request:
-            return pending.result()
+            if pending is not None:
+                return pending
+
+        self._admission.acquire()
+        with self._cache_lock:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                self._admission.release()
+                completed = Future()
+                completed.set_result(cached)
+                return completed
+            pending = self._inflight.get(cache_key)
+            if pending is not None:
+                self._admission.release()
+                return pending
+            pending = Future()
+            self._inflight[cache_key] = pending
 
         try:
-            result = self._embed_uncached(text)
-        except Exception as error:
+            execution = self._executor.submit(self._execute, cache_key, text, pending)
+        except BaseException as error:
             with self._cache_lock:
                 self._inflight.pop(cache_key, None)
             pending.set_exception(error)
-            raise
+            self._admission.release()
+        else:
+            execution.add_done_callback(lambda _future: self._admission.release())
+        return pending
+
+    def _execute(
+        self,
+        cache_key: tuple[str, int, str, str],
+        text: str,
+        pending: Future[EmbeddingResult],
+    ) -> None:
+        try:
+            result = self._embed_uncached(text)
+        except BaseException as error:
+            with self._cache_lock:
+                self._inflight.pop(cache_key, None)
+            pending.set_exception(error)
+            return
 
         with self._cache_lock:
             self._cache[cache_key] = result
             self._inflight.pop(cache_key, None)
         pending.set_result(result)
-        return result
 
     def _embed_uncached(self, text: str) -> EmbeddingResult:
         response = self._request(text)
@@ -171,7 +209,7 @@ class VertexEmbeddingClient:
                 text = next(iterator)
             except StopIteration:
                 break
-            pending.append(self._executor.submit(self.embed, text))
+            pending.append(self._submit(text))
 
         results: list[EmbeddingResult] = []
         while pending:
@@ -180,11 +218,13 @@ class VertexEmbeddingClient:
                 text = next(iterator)
             except StopIteration:
                 continue
-            pending.append(self._executor.submit(self.embed, text))
+            pending.append(self._submit(text))
         return results
 
     def _request(self, text: str) -> Any:
         for attempt in range(self._max_attempts):
+            retry_delay: float | None = None
+            request_failed = False
             try:
                 return self._client.models.embed_content(
                     model=self.model,
@@ -196,7 +236,15 @@ class VertexEmbeddingClient:
                     ),
                 )
             except errors.APIError as error:
-                if error.code not in _TRANSIENT_STATUS_CODES or attempt + 1 >= self._max_attempts:
-                    raise
-                self._sleep(self._initial_retry_delay * (2**attempt))
-        raise RuntimeError("embedding request exhausted attempts")
+                can_retry = (
+                    error.code in _TRANSIENT_STATUS_CODES and attempt + 1 < self._max_attempts
+                )
+                if can_retry:
+                    retry_delay = self._initial_retry_delay * (2**attempt)
+                else:
+                    request_failed = True
+            if request_failed:
+                raise EmbeddingRequestError(_SAFE_REQUEST_ERROR)
+            if retry_delay is not None:
+                self._sleep(retry_delay)
+        raise EmbeddingRequestError(_SAFE_REQUEST_ERROR)
