@@ -148,7 +148,7 @@ def _source_with_metadata(metadata):
     )
 
 
-def _chunk_with_metadata(metadata):
+def _chunk_with_metadata(metadata, *, heading_path=("Heading",), embedding=None):
     return DocumentChunk(
         chunk_id="chunk",
         source_id="source",
@@ -156,14 +156,71 @@ def _chunk_with_metadata(metadata):
         ordinal=0,
         text="text",
         contextual_text="context\n\ntext",
-        heading_path=("Heading",),
+        heading_path=heading_path,
         symbol=None,
         start_line=1,
         end_line=1,
         content_hash="hash",
         citation="note.md#L1",
+        embedding=embedding,
         metadata=metadata,
     )
+
+
+class _SelfAliasingMutable:
+    def __init__(self):
+        self.values = []
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+@pytest.mark.parametrize("record_factory", [_source_with_metadata, _chunk_with_metadata])
+def test_metadata_rejects_unsupported_self_aliasing_mutable_objects(record_factory):
+    unsupported = _SelfAliasingMutable()
+
+    with pytest.raises(
+        TypeError,
+        match="unsupported metadata value type: _SelfAliasingMutable",
+    ):
+        record_factory({"unsupported": unsupported})
+
+
+def test_atomic_unit_normalizes_heading_path_without_caller_aliases():
+    heading_path = ["Heading"]
+    unit = AtomicUnit(
+        text="text",
+        heading_path=heading_path,
+        symbol=None,
+        start_line=1,
+        end_line=1,
+        token_estimate=1,
+    )
+
+    heading_path.append("Changed")
+
+    assert unit.heading_path == ("Heading",)
+    assert isinstance(unit.heading_path, tuple)
+
+
+def test_document_chunk_normalizes_heading_path_without_caller_aliases():
+    heading_path = ["Heading"]
+    chunk = _chunk_with_metadata({}, heading_path=heading_path)
+
+    heading_path.append("Changed")
+
+    assert chunk.heading_path == ("Heading",)
+    assert isinstance(chunk.heading_path, tuple)
+
+
+def test_document_chunk_normalizes_embedding_without_caller_aliases():
+    embedding = [0.25, 0.75]
+    chunk = _chunk_with_metadata({}, embedding=embedding)
+
+    embedding[0] = 1.0
+
+    assert chunk.embedding == (0.25, 0.75)
+    assert isinstance(chunk.embedding, tuple)
 
 
 @pytest.mark.parametrize("record_factory", [_source_with_metadata, _chunk_with_metadata])
