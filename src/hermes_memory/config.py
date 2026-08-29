@@ -85,6 +85,12 @@ def _load_document_setting(overrides, setting, environment, default):
 
 
 def _load_document_int(overrides, setting, environment, default):
+    override = overrides.get(setting, _DOCUMENT_OVERRIDE_MISSING)
+    if override is not _DOCUMENT_OVERRIDE_MISSING:
+        value = _load_document_setting(overrides, setting, environment, default)
+        if type(value) is not int:
+            raise TypeError(f"{setting} must be an integer")
+        return value
     return int(_load_document_setting(overrides, setting, environment, default))
 
 
