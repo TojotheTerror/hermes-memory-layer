@@ -157,7 +157,7 @@ def test_terraform_defines_protected_document_tables_without_indexes():
         )
         assert resource, f"missing Terraform resource for {table_name}"
         assert re.search(rf'table_id\s*=\s*"{table_name}"', resource.group(1))
-        assert f'schemas/{table_name}.json' in resource.group(1)
+        assert f"schemas/{table_name}.json" in resource.group(1)
         assert "deletion_protection = true" in resource.group(1)
         assert re.search(r"lifecycle\s*\{\s*prevent_destroy\s*=\s*true\s*\}", resource.group(1))
         quoted_fields = ", ".join(f'"{field}"' for field in cluster_fields)
@@ -189,8 +189,11 @@ def test_terraform_passes_each_schema_fields_array_to_provider(table_name):
 
 
 class _FakeJob:
+    def __init__(self, rows=None):
+        self._rows = rows
+
     def result(self):
-        return None
+        return self._rows
 
 
 class _FakeBigQueryClient:
@@ -200,6 +203,380 @@ class _FakeBigQueryClient:
     def query(self, sql):
         self.queries.append(sql)
         return _FakeJob()
+
+
+class _StoreFakeClient:
+    def __init__(self, query_results=()):
+        self.queries = []
+        self.query_results = list(query_results)
+        self.inserts = []
+
+    def query(self, sql, job_config=None):
+        self.queries.append((sql, job_config))
+        rows = self.query_results.pop(0) if self.query_results else []
+        return _FakeJob(rows)
+
+    def insert_rows_json(self, table, rows, row_ids):
+        self.inserts.append((table, rows, row_ids))
+        return []
+
+
+class _RevisionFakeClient(_StoreFakeClient):
+    def __init__(self, chunks):
+        super().__init__()
+        self.chunks = {chunk["chunk_id"]: dict(chunk) for chunk in chunks}
+
+    def query(self, sql, job_config=None):
+        self.queries.append((sql, job_config))
+        parameters = _query_parameters(job_config)
+        matching = [
+            chunk
+            for chunk in self.chunks.values()
+            if chunk["source_id"] == parameters["source_id"]
+            and chunk["user_id"] == parameters["user_id"]
+            and chunk["agent_name"] == parameters["agent_name"]
+        ]
+        if "present_count" in sql:
+            expected = set(parameters["active_chunk_ids"])
+            present_count = len({chunk["chunk_id"] for chunk in matching} & expected)
+            return _FakeJob([{"present_count": present_count}])
+        if "SET is_active" in sql:
+            active = set(parameters["active_chunk_ids"])
+            for chunk in matching:
+                chunk["is_active"] = chunk["chunk_id"] in active
+            return _FakeJob([])
+        raise AssertionError(f"unexpected query: {sql}")
+
+    def active_chunk_ids(self):
+        return {chunk_id for chunk_id, chunk in self.chunks.items() if chunk["is_active"]}
+
+
+def _query_parameters(job_config):
+    return {
+        parameter.name: parameter.value if hasattr(parameter, "value") else parameter.values
+        for parameter in job_config.query_parameters
+    }
+
+
+def _source(**overrides):
+    source = {
+        "source_id": "source-1",
+        "corpus_id": "corpus-1",
+        "source_kind": "obsidian",
+        "content_kind": "markdown",
+        "relative_path": "notes/it's-complicated.md",
+        "source_uri": "file:///vault/notes/it's-complicated.md",
+        "revision": "revision-1",
+        "content_hash": "hash-1",
+        "metadata": {"label": "pilot"},
+    }
+    source.update(overrides)
+    return source
+
+
+def _chunk(**overrides):
+    chunk = {
+        "chunk_id": "chunk-1",
+        "source_id": "source-1",
+        "corpus_id": "corpus-1",
+        "ordinal": 0,
+        "text": "Chunk body",
+        "contextual_text": "Heading\nChunk body",
+        "content_hash": "chunk-hash-1",
+        "heading_path": ("Heading",),
+        "symbol": None,
+        "start_line": 2,
+        "end_line": 3,
+        "citation": "notes/example.md#L2-L3",
+        "embedding": (0.1, 0.2, 0.3),
+        "embedding_model": "test-embedding-model",
+        "embedding_dimensions": 3,
+        "metadata": {"kind": "paragraph"},
+    }
+    chunk.update(overrides)
+    return chunk
+
+
+def test_upsert_source_skips_unchanged_source_with_parameterized_lookup(monkeypatch):
+    source = _source()
+    client = _StoreFakeClient(
+        [
+            [
+                {
+                    "source_id": source["source_id"],
+                    "revision": source["revision"],
+                    "content_hash": source["content_hash"],
+                    "is_active": True,
+                }
+            ]
+        ]
+    )
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    changed = bigquery_store.upsert_source(
+        source,
+        user_id="user' OR TRUE --",
+        agent_name="hermes",
+        cfg=cfg,
+    )
+
+    assert changed is False
+    assert len(client.queries) == 1
+    sql, job_config = client.queries[0]
+    assert source["source_id"] not in sql
+    assert "user' OR TRUE --" not in sql
+    assert "@source_id" in sql and "@user_id" in sql
+    assert _query_parameters(job_config) == {
+        "source_id": source["source_id"],
+        "user_id": "user' OR TRUE --",
+        "agent_name": "hermes",
+    }
+
+
+def test_upsert_source_parameterizes_every_source_value(monkeypatch):
+    source = _source(
+        source_id="source'; DROP TABLE x --",
+        corpus_id="corpus'; DROP TABLE x --",
+        relative_path="notes/'quoted'.md",
+        source_uri="file:///vault/notes/'quoted'.md",
+    )
+    client = _StoreFakeClient([[], []])
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    changed = bigquery_store.upsert_source(
+        source,
+        user_id="user'; DROP TABLE x --",
+        agent_name="agent'; DROP TABLE x --",
+        cfg=cfg,
+    )
+
+    assert changed is True
+    assert len(client.queries) == 2
+    sql, job_config = client.queries[1]
+    for value in (
+        *source.values(),
+        "user'; DROP TABLE x --",
+        "agent'; DROP TABLE x --",
+    ):
+        if isinstance(value, str):
+            assert value not in sql
+    parameters = _query_parameters(job_config)
+    assert parameters["source_id"] == source["source_id"]
+    assert parameters["corpus_id"] == source["corpus_id"]
+    assert parameters["relative_path"] == source["relative_path"]
+    assert parameters["source_uri"] == source["source_uri"]
+    assert parameters["user_id"] == "user'; DROP TABLE x --"
+    assert parameters["agent_name"] == "agent'; DROP TABLE x --"
+    assert json.loads(parameters["metadata"]) == source["metadata"]
+
+
+def test_insert_chunks_uses_chunk_ids_as_deterministic_insert_ids(monkeypatch):
+    chunks = [_chunk(), _chunk(chunk_id="chunk-2", ordinal=1)]
+    client = _StoreFakeClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    inserted = bigquery_store.insert_chunks(
+        chunks,
+        user_id="user-1",
+        agent_name="hermes",
+        embedding_model="test-embedding-model",
+        embedding_dimensions=3,
+        cfg=cfg,
+    )
+
+    assert inserted == 2
+    assert len(client.inserts) == 1
+    table, rows, row_ids = client.inserts[0]
+    assert table == "test-project.test_dataset.document_chunks"
+    assert row_ids == ["chunk-1", "chunk-2"]
+    assert [row["chunk_id"] for row in rows] == row_ids
+    assert all(row["is_active"] is False for row in rows)
+    assert all(row["embedding_model"] == "test-embedding-model" for row in rows)
+    assert all(row["embedding_dimensions"] == 3 for row in rows)
+
+
+@pytest.mark.parametrize(
+    "chunk",
+    [
+        pytest.param(_chunk(embedding_model="wrong-model"), id="model"),
+        pytest.param(_chunk(embedding_dimensions=2), id="declared-dimensions"),
+        pytest.param(_chunk(embedding=(0.1, 0.2)), id="vector-length"),
+    ],
+)
+def test_insert_chunks_rejects_embedding_contract_before_client_writes(monkeypatch, chunk):
+    client = _StoreFakeClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    with pytest.raises(ValueError, match="embedding"):
+        bigquery_store.insert_chunks(
+            [chunk],
+            user_id="user-1",
+            agent_name="hermes",
+            embedding_model="test-embedding-model",
+            embedding_dimensions=3,
+            cfg=cfg,
+        )
+
+    assert client.queries == []
+    assert client.inserts == []
+
+
+def test_finalize_source_revision_preserves_old_active_chunks_when_new_set_is_incomplete(
+    monkeypatch,
+):
+    client = _RevisionFakeClient(
+        [
+            {
+                "chunk_id": "old-active",
+                "source_id": "source'; --",
+                "user_id": "user'; --",
+                "agent_name": "hermes",
+                "is_active": True,
+            },
+            {
+                "chunk_id": "new-present",
+                "source_id": "source'; --",
+                "user_id": "user'; --",
+                "agent_name": "hermes",
+                "is_active": False,
+            },
+        ]
+    )
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    with pytest.raises(RuntimeError, match="missing 1 expected chunk"):
+        bigquery_store.finalize_source_revision(
+            "source'; --",
+            ["new-present", "new-missing'; --"],
+            user_id="user'; --",
+            agent_name="hermes",
+            cfg=cfg,
+        )
+
+    assert client.active_chunk_ids() == {"old-active"}
+    assert len(client.queries) == 1
+    sql, job_config = client.queries[0]
+    assert "source'; --" not in sql
+    assert "new-missing'; --" not in sql
+    assert _query_parameters(job_config)["active_chunk_ids"] == [
+        "new-present",
+        "new-missing'; --",
+    ]
+
+
+def test_finalize_source_revision_switches_active_set_only_after_completeness_proof(monkeypatch):
+    chunks = [
+        {
+            "chunk_id": "old-active",
+            "source_id": "source-1",
+            "user_id": "user-1",
+            "agent_name": "hermes",
+            "is_active": True,
+        },
+        {
+            "chunk_id": "new-1",
+            "source_id": "source-1",
+            "user_id": "user-1",
+            "agent_name": "hermes",
+            "is_active": False,
+        },
+        {
+            "chunk_id": "new-2",
+            "source_id": "source-1",
+            "user_id": "user-1",
+            "agent_name": "hermes",
+            "is_active": False,
+        },
+    ]
+    client = _RevisionFakeClient(chunks)
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    bigquery_store.finalize_source_revision(
+        "source-1",
+        ["new-1", "new-2"],
+        user_id="user-1",
+        agent_name="hermes",
+        cfg=cfg,
+    )
+
+    assert client.active_chunk_ids() == {"new-1", "new-2"}
+    assert len(client.queries) == 2
+    assert "present_count" in client.queries[0][0]
+    assert "SET is_active" in client.queries[1][0]
+    for sql, job_config in client.queries:
+        assert "source-1" not in sql
+        assert "new-1" not in sql
+        assert _query_parameters(job_config)["active_chunk_ids"] == ["new-1", "new-2"]
+
+
+def test_deactivate_missing_sources_requires_explicit_prune(monkeypatch):
+    client = _StoreFakeClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    with pytest.raises(ValueError, match="prune=True"):
+        bigquery_store.deactivate_missing_sources(
+            "corpus-1",
+            ["source-1"],
+            user_id="user-1",
+            agent_name="hermes",
+            cfg=cfg,
+        )
+
+    assert client.queries == []
+
+
+def test_deactivate_missing_sources_rejects_limited_runs_before_client_writes(monkeypatch):
+    client = _StoreFakeClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    with pytest.raises(ValueError, match="limited run"):
+        bigquery_store.deactivate_missing_sources(
+            "corpus-1",
+            ["source-1"],
+            user_id="user-1",
+            agent_name="hermes",
+            prune=True,
+            limited=True,
+            cfg=cfg,
+        )
+
+    assert client.queries == []
+
+
+def test_deactivate_missing_sources_parameterizes_scope_and_deactivates_chunks(monkeypatch):
+    client = _StoreFakeClient([[]])
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    bigquery_store.deactivate_missing_sources(
+        "corpus'; --",
+        ["seen-1", "seen'; --"],
+        user_id="user'; --",
+        agent_name="agent'; --",
+        prune=True,
+        cfg=cfg,
+    )
+
+    assert len(client.queries) == 1
+    sql, job_config = client.queries[0]
+    assert "BEGIN TRANSACTION" in sql and "COMMIT TRANSACTION" in sql
+    assert "document_chunks" in sql and "document_sources" in sql
+    for value in ("corpus'; --", "seen-1", "seen'; --", "user'; --", "agent'; --"):
+        assert value not in sql
+    assert _query_parameters(job_config) == {
+        "corpus_id": "corpus'; --",
+        "seen_source_ids": ["seen-1", "seen'; --"],
+        "user_id": "user'; --",
+        "agent_name": "agent'; --",
+    }
 
 
 @pytest.mark.parametrize("dataset_id", ["123dataset", "7", "a" * 1024])
@@ -253,9 +630,7 @@ def test_ensure_tables_rejects_invalid_dataset_identifiers_before_query(monkeypa
         ("bq_dataset", "other_project.test_dataset"),
     ],
 )
-def test_ensure_tables_rejects_adversarial_ddl_identifiers_before_query(
-    monkeypatch, field, value
-):
+def test_ensure_tables_rejects_adversarial_ddl_identifiers_before_query(monkeypatch, field, value):
     client = _FakeBigQueryClient()
     monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
     cfg = (

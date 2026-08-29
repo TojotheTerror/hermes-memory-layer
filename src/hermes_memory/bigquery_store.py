@@ -1,4 +1,5 @@
 """BigQuery store — dataset, tables, views, inserts, vector search, analytics."""
+
 from __future__ import annotations
 
 import re
@@ -134,10 +135,13 @@ def _validate_ddl_identifiers(cfg: HermesMemoryConfig) -> None:
 def _bq_client(cfg: HermesMemoryConfig):
     try:
         from google.cloud import bigquery
+
         # Don't pin location on client — BigQuery is global endpoint, dataset location is per-resource.
         return bigquery.Client(project=cfg.project)
     except ImportError as e:
-        raise RuntimeError("google-cloud-bigquery not installed. pip install google-cloud-bigquery") from e
+        raise RuntimeError(
+            "google-cloud-bigquery not installed. pip install google-cloud-bigquery"
+        ) from e
     except Exception as e:
         print(f"[hermes-memory] BigQuery client unavailable: {e}")
         return None
@@ -150,6 +154,7 @@ def ensure_dataset(cfg: HermesMemoryConfig | None = None):
         print(f"[mock] ensure_dataset {cfg.project}.{cfg.bq_dataset} ({cfg.bq_location})")
         return
     from google.cloud import bigquery
+
     dataset_id = f"{cfg.project}.{cfg.bq_dataset}"
     dataset = bigquery.Dataset(dataset_id)
     dataset.location = cfg.bq_location
@@ -182,6 +187,291 @@ def ensure_tables(cfg: HermesMemoryConfig | None = None):
         print(f"View ready: {cfg.bq_dataset}.{vname}")
 
 
+def get_source_state(
+    source_id: str,
+    *,
+    user_id: str,
+    agent_name: str,
+    cfg: HermesMemoryConfig | None = None,
+    client=None,
+) -> dict | None:
+    """Return the current source row for an identity, if it exists."""
+    cfg = cfg or load_config()
+    _validate_ddl_identifiers(cfg)
+    client = client or _bq_client(cfg)
+    if client is None:
+        return None
+
+    from google.cloud import bigquery as _bq
+
+    table = f"`{cfg.project}.{cfg.bq_dataset}.document_sources`"
+    sql = f"""SELECT source_id, revision, content_hash, is_active
+FROM {table}
+WHERE source_id = @source_id AND user_id = @user_id AND agent_name = @agent_name
+LIMIT 1"""
+    job_config = _bq.QueryJobConfig(
+        query_parameters=[
+            _bq.ScalarQueryParameter("source_id", "STRING", source_id),
+            _bq.ScalarQueryParameter("user_id", "STRING", user_id),
+            _bq.ScalarQueryParameter("agent_name", "STRING", agent_name),
+        ]
+    )
+    rows = list(client.query(sql, job_config=job_config).result())
+    return dict(rows[0]) if rows else None
+
+
+def upsert_source(
+    source: dict,
+    *,
+    user_id: str,
+    agent_name: str,
+    cfg: HermesMemoryConfig | None = None,
+) -> bool:
+    """Return false without writing when the active source revision is unchanged."""
+    cfg = cfg or load_config()
+    _validate_ddl_identifiers(cfg)
+    client = _bq_client(cfg)
+    state = get_source_state(
+        source["source_id"],
+        user_id=user_id,
+        agent_name=agent_name,
+        cfg=cfg,
+        client=client,
+    )
+    if (
+        state
+        and state.get("is_active")
+        and state.get("revision") == source["revision"]
+        and state.get("content_hash") == source["content_hash"]
+    ):
+        return False
+    if client is None:
+        raise RuntimeError("BigQuery client unavailable")
+
+    import json as _json
+    from google.cloud import bigquery as _bq
+
+    table = f"`{cfg.project}.{cfg.bq_dataset}.document_sources`"
+    sql = f"""MERGE {table} AS target
+USING (SELECT @source_id AS source_id, @user_id AS user_id, @agent_name AS agent_name) AS incoming
+ON target.source_id = incoming.source_id
+  AND target.user_id = incoming.user_id
+  AND target.agent_name = incoming.agent_name
+WHEN MATCHED THEN UPDATE SET
+  corpus_id = @corpus_id,
+  source_kind = @source_kind,
+  content_kind = @content_kind,
+  relative_path = @relative_path,
+  source_uri = @source_uri,
+  revision = @revision,
+  content_hash = @content_hash,
+  metadata = PARSE_JSON(@metadata),
+  is_active = TRUE,
+  last_seen_at = CURRENT_TIMESTAMP(),
+  updated_at = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT
+  (source_id, corpus_id, user_id, agent_name, source_kind, content_kind,
+   relative_path, source_uri, revision, content_hash, metadata, is_active,
+   first_seen_at, last_seen_at, updated_at)
+VALUES
+  (@source_id, @corpus_id, @user_id, @agent_name, @source_kind, @content_kind,
+   @relative_path, @source_uri, @revision, @content_hash, PARSE_JSON(@metadata), TRUE,
+   CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())"""
+    job_config = _bq.QueryJobConfig(
+        query_parameters=[
+            _bq.ScalarQueryParameter("source_id", "STRING", source["source_id"]),
+            _bq.ScalarQueryParameter("corpus_id", "STRING", source["corpus_id"]),
+            _bq.ScalarQueryParameter("user_id", "STRING", user_id),
+            _bq.ScalarQueryParameter("agent_name", "STRING", agent_name),
+            _bq.ScalarQueryParameter("source_kind", "STRING", source["source_kind"]),
+            _bq.ScalarQueryParameter("content_kind", "STRING", source["content_kind"]),
+            _bq.ScalarQueryParameter("relative_path", "STRING", source["relative_path"]),
+            _bq.ScalarQueryParameter("source_uri", "STRING", source["source_uri"]),
+            _bq.ScalarQueryParameter("revision", "STRING", source["revision"]),
+            _bq.ScalarQueryParameter("content_hash", "STRING", source["content_hash"]),
+            _bq.ScalarQueryParameter(
+                "metadata", "STRING", _json.dumps(source.get("metadata") or {})
+            ),
+        ]
+    )
+    client.query(sql, job_config=job_config).result()
+    return True
+
+
+def insert_chunks(
+    chunks: list[dict],
+    *,
+    user_id: str,
+    agent_name: str,
+    embedding_model: str,
+    embedding_dimensions: int,
+    cfg: HermesMemoryConfig | None = None,
+) -> int:
+    """Insert inactive chunks using chunk identities as retry-stable insert IDs."""
+    if not chunks:
+        return 0
+    cfg = cfg or load_config()
+    _validate_ddl_identifiers(cfg)
+    for chunk in chunks:
+        if chunk.get("embedding_model") != embedding_model:
+            raise ValueError(f"chunk {chunk.get('chunk_id')!r} has wrong embedding model")
+        if chunk.get("embedding_dimensions") != embedding_dimensions:
+            raise ValueError(f"chunk {chunk.get('chunk_id')!r} has wrong embedding dimensions")
+        embedding = chunk.get("embedding")
+        if embedding is None or len(embedding) != embedding_dimensions:
+            raise ValueError(f"chunk {chunk.get('chunk_id')!r} has wrong embedding vector length")
+    client = _bq_client(cfg)
+    if client is None:
+        raise RuntimeError("BigQuery client unavailable")
+
+    from datetime import datetime, timezone
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    rows = [
+        {
+            "chunk_id": chunk["chunk_id"],
+            "source_id": chunk["source_id"],
+            "corpus_id": chunk["corpus_id"],
+            "user_id": user_id,
+            "agent_name": agent_name,
+            "ordinal": chunk["ordinal"],
+            "content": chunk["text"],
+            "contextual_content": chunk["contextual_text"],
+            "content_hash": chunk["content_hash"],
+            "heading_path": list(chunk.get("heading_path") or ()),
+            "symbol": chunk.get("symbol"),
+            "start_line": chunk.get("start_line"),
+            "end_line": chunk.get("end_line"),
+            "citation": chunk["citation"],
+            "embedding": list(chunk["embedding"]),
+            "embedding_model": embedding_model,
+            "embedding_dimensions": embedding_dimensions,
+            "metadata": chunk.get("metadata") or {},
+            "is_active": False,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        }
+        for chunk in chunks
+    ]
+    table = f"{cfg.project}.{cfg.bq_dataset}.document_chunks"
+    row_ids = [chunk["chunk_id"] for chunk in chunks]
+    errors = client.insert_rows_json(table, rows, row_ids=row_ids)
+    if errors:
+        raise RuntimeError(f"BigQuery chunk insert failed: {errors}")
+    return len(rows)
+
+
+def finalize_source_revision(
+    source_id: str,
+    active_chunk_ids: list[str],
+    *,
+    user_id: str,
+    agent_name: str,
+    cfg: HermesMemoryConfig | None = None,
+) -> None:
+    """Activate a complete revision and only then retire its unmatched chunks."""
+    cfg = cfg or load_config()
+    _validate_ddl_identifiers(cfg)
+    client = _bq_client(cfg)
+    if client is None:
+        raise RuntimeError("BigQuery client unavailable")
+
+    from google.cloud import bigquery as _bq
+
+    chunk_ids = list(dict.fromkeys(active_chunk_ids))
+    table = f"`{cfg.project}.{cfg.bq_dataset}.document_chunks`"
+    parameters = [
+        _bq.ScalarQueryParameter("source_id", "STRING", source_id),
+        _bq.ScalarQueryParameter("user_id", "STRING", user_id),
+        _bq.ScalarQueryParameter("agent_name", "STRING", agent_name),
+        _bq.ArrayQueryParameter("active_chunk_ids", "STRING", chunk_ids),
+    ]
+    proof_sql = f"""SELECT COUNT(DISTINCT chunk_id) AS present_count
+FROM {table}
+WHERE source_id = @source_id
+  AND user_id = @user_id
+  AND agent_name = @agent_name
+  AND chunk_id IN UNNEST(@active_chunk_ids)"""
+    rows = list(
+        client.query(
+            proof_sql,
+            job_config=_bq.QueryJobConfig(query_parameters=parameters),
+        ).result()
+    )
+    present_count = int(dict(rows[0])["present_count"]) if rows else 0
+    if present_count != len(chunk_ids):
+        missing_count = len(chunk_ids) - present_count
+        noun = "chunk" if missing_count == 1 else "chunks"
+        raise RuntimeError(
+            f"missing {missing_count} expected {noun}; source revision not finalized"
+        )
+
+    activate_sql = f"""UPDATE {table}
+SET is_active = chunk_id IN UNNEST(@active_chunk_ids),
+    updated_at = CURRENT_TIMESTAMP()
+WHERE source_id = @source_id
+  AND user_id = @user_id
+  AND agent_name = @agent_name
+  AND (is_active OR chunk_id IN UNNEST(@active_chunk_ids))"""
+    client.query(
+        activate_sql,
+        job_config=_bq.QueryJobConfig(query_parameters=parameters),
+    ).result()
+
+
+def deactivate_missing_sources(
+    corpus_id: str,
+    seen_source_ids: list[str],
+    *,
+    user_id: str,
+    agent_name: str,
+    prune: bool = False,
+    limited: bool = False,
+    cfg: HermesMemoryConfig | None = None,
+) -> None:
+    """Deactivate unseen corpus sources only for an explicit, complete prune run."""
+    if not prune:
+        raise ValueError("deactivate_missing_sources requires prune=True")
+    if limited:
+        raise ValueError("cannot prune during a limited run")
+
+    cfg = cfg or load_config()
+    _validate_ddl_identifiers(cfg)
+    client = _bq_client(cfg)
+    if client is None:
+        raise RuntimeError("BigQuery client unavailable")
+
+    from google.cloud import bigquery as _bq
+
+    sources = f"`{cfg.project}.{cfg.bq_dataset}.document_sources`"
+    chunks = f"`{cfg.project}.{cfg.bq_dataset}.document_chunks`"
+    sql = f"""BEGIN TRANSACTION;
+UPDATE {chunks}
+SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP()
+WHERE corpus_id = @corpus_id
+  AND user_id = @user_id
+  AND agent_name = @agent_name
+  AND source_id NOT IN UNNEST(@seen_source_ids);
+UPDATE {sources}
+SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP()
+WHERE corpus_id = @corpus_id
+  AND user_id = @user_id
+  AND agent_name = @agent_name
+  AND source_id NOT IN UNNEST(@seen_source_ids);
+COMMIT TRANSACTION;"""
+    job_config = _bq.QueryJobConfig(
+        query_parameters=[
+            _bq.ScalarQueryParameter("corpus_id", "STRING", corpus_id),
+            _bq.ArrayQueryParameter(
+                "seen_source_ids", "STRING", list(dict.fromkeys(seen_source_ids))
+            ),
+            _bq.ScalarQueryParameter("user_id", "STRING", user_id),
+            _bq.ScalarQueryParameter("agent_name", "STRING", agent_name),
+        ]
+    )
+    client.query(sql, job_config=job_config).result()
+
+
 def insert_memory(
     fact: str,
     scope: dict,
@@ -195,6 +485,7 @@ def insert_memory(
     cfg = cfg or load_config()
     client = _bq_client(cfg)
     import uuid
+
     mem_id = memory_id or str(uuid.uuid4())
     if client is None:
         print(f"[mock] insert_memory: {mem_id} fact={fact[:60]} scope={scope}")
@@ -216,7 +507,9 @@ def insert_memory(
             _bq.ScalarQueryParameter("agent_name", "STRING", scope.get("agent_name", "")),
             _bq.ScalarQueryParameter("source", "STRING", source),
             _bq.ScalarQueryParameter("session_name", "STRING", session_name),
-            _bq.ScalarQueryParameter("metadata", "STRING", _json.dumps(metadata) if metadata else "null"),
+            _bq.ScalarQueryParameter(
+                "metadata", "STRING", _json.dumps(metadata) if metadata else "null"
+            ),
             _bq.ScalarQueryParameter("ttl_days", "INT64", cfg.ttl_days),
         ]
     )
@@ -230,7 +523,13 @@ def insert_memory(
     return {"memory_id": mem_id, "fact": fact, "scope": scope}
 
 
-def insert_session(session_name: str, user_id: str, events: list[dict], cfg: HermesMemoryConfig | None = None, agent_name: str | None = None):
+def insert_session(
+    session_name: str,
+    user_id: str,
+    events: list[dict],
+    cfg: HermesMemoryConfig | None = None,
+    agent_name: str | None = None,
+):
     cfg = cfg or load_config()
     client = _bq_client(cfg)
     session_id = session_name.split("/")[-1]
@@ -261,7 +560,12 @@ def insert_session(session_name: str, user_id: str, events: list[dict], cfg: Her
     return {"session_name": session_name, "session_id": session_id, "user_id": user_id}
 
 
-def vector_search(query_embedding: list[float], scope: dict | None = None, top_k: int = 8, cfg: HermesMemoryConfig | None = None) -> list[dict]:
+def vector_search(
+    query_embedding: list[float],
+    scope: dict | None = None,
+    top_k: int = 8,
+    cfg: HermesMemoryConfig | None = None,
+) -> list[dict]:
     """BigQuery VECTOR_SEARCH — requires embeddings populated. Mock fallback returns SQL string."""
     cfg = cfg or load_config()
     if scope and scope.get("user_id"):
