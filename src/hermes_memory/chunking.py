@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 from math import ceil
+import re
 
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
 
 from hermes_memory.documents import AtomicUnit
 
-__all__ = ["AtomicUnit", "pack_markdown_units", "parse_markdown_units"]
+__all__ = ["AtomicUnit", "pack_markdown_units", "parse_code_units", "parse_markdown_units"]
 
 _MARKDOWN = MarkdownIt("commonmark")
 _UNIT_TOKEN_TYPES = {
@@ -75,6 +77,122 @@ def _unit(lines: list[str], start: int, end: int, heading_path: tuple[str, ...])
 
 def _token_estimate(text: str) -> int:
     return max(1, ceil(len(text) / 4))
+
+
+def _python_symbols(
+    tree: ast.AST,
+) -> list[tuple[ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef, tuple[str, ...]]]:
+    symbols: list[
+        tuple[ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef, tuple[str, ...]]
+    ] = []
+
+    def visit(node: ast.AST, path: tuple[str, ...]) -> None:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            path = (*path, node.name)
+            symbols.append((node, path))
+        for child in ast.iter_child_nodes(node):
+            visit(child, path)
+
+    visit(tree, ())
+    return symbols
+
+
+def _python_symbol_start(
+    node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+    lines: list[str],
+) -> int:
+    """Return a zero-based start including decorators and adjacent comments."""
+    first_line = min([node.lineno, *(decorator.lineno for decorator in node.decorator_list)])
+    start = first_line - 1
+    while start and lines[start - 1].rstrip("\r\n").lstrip(" \t").startswith("#"):
+        start -= 1
+    return start
+
+
+def _generic_code_windows(text: str, *, max_tokens: int, max_lines: int) -> list[AtomicUnit]:
+    """Split source deterministically while preserving every source character."""
+    max_characters = max_tokens * 4
+    windows: list[AtomicUnit] = []
+    current: list[str] = []
+    current_start = 0
+    current_end = 0
+    current_characters = 0
+
+    def flush() -> None:
+        nonlocal current, current_start, current_end, current_characters
+        if not current:
+            return
+        source = "".join(current)
+        windows.append(
+            AtomicUnit(source, (), None, current_start, current_end, _token_estimate(source))
+        )
+        current = []
+        current_start = 0
+        current_end = 0
+        current_characters = 0
+
+    for line_number, line in enumerate(_split_markdown_lines(text), start=1):
+        offset = 0
+        while offset < len(line):
+            if current and line_number - current_start + 1 > max_lines:
+                flush()
+            if not current:
+                current_start = line_number
+            available = max_characters - current_characters
+            take = min(available, len(line) - offset)
+            current.append(line[offset : offset + take])
+            current_characters += take
+            current_end = line_number
+            offset += take
+            if current_characters == max_characters:
+                flush()
+    flush()
+    return windows
+
+
+def parse_code_units(
+    text: str,
+    language: str,
+    *,
+    max_tokens: int,
+    max_lines: int = 200,
+) -> list[AtomicUnit]:
+    """Return Python symbols or source-preserving generic language windows."""
+    if type(language) is not str or re.fullmatch(r"[a-z][a-z0-9_.+#-]*", language) is None:
+        raise ValueError("language must be a lowercase identifier")
+    if (
+        type(max_tokens) is not int
+        or type(max_lines) is not int
+        or max_tokens <= 0
+        or max_lines <= 0
+    ):
+        raise ValueError("max_tokens and max_lines must be positive integers")
+    if language != "python":
+        return _generic_code_windows(text, max_tokens=max_tokens, max_lines=max_lines)
+
+    lines = _split_markdown_lines(text)
+    try:
+        tree = ast.parse(text.replace("\r\n", "\n").replace("\r", "\n"))
+    except SyntaxError:
+        return _generic_code_windows(text, max_tokens=max_tokens, max_lines=max_lines)
+    units: list[AtomicUnit] = []
+    for node, path in _python_symbols(tree):
+        start = _python_symbol_start(node, lines)
+        end = node.end_lineno
+        if end is None:  # pragma: no cover - populated by supported Python versions
+            raise ValueError("Python AST node has no end line")
+        source = "".join(lines[start:end])
+        units.append(
+            AtomicUnit(
+                text=source,
+                heading_path=(),
+                symbol=".".join(path),
+                start_line=start + 1,
+                end_line=end,
+                token_estimate=_token_estimate(source),
+            )
+        )
+    return units
 
 
 def _pack(units: list[AtomicUnit]) -> AtomicUnit:
