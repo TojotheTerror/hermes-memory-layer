@@ -345,18 +345,25 @@ def _generated_content_rule(content: bytes) -> str | None:
 
 
 def _stable_bounded_read(
-    target: Path, expected_stat: os.stat_result, max_file_size_bytes: int
+    target: Path,
+    root: Path,
+    expected_stat: os.stat_result,
+    max_file_size_bytes: int,
 ) -> tuple[bytes | None, str | None]:
     """Read an approved target bounded, with no-follow when available and identity checks."""
 
     descriptor = -1
     try:
-        if target.resolve(strict=True) != target:
+        resolved_target = target.resolve(strict=True)
+        if resolved_target != target or not resolved_target.is_relative_to(root):
             return None, "detection_error"
         path_stat = target.stat(follow_symlinks=False)
         expected_identity = (expected_stat.st_dev, expected_stat.st_ino)
         if (
-            stat.S_ISLNK(path_stat.st_mode)
+            not stat.S_ISREG(expected_stat.st_mode)
+            or expected_stat.st_nlink != 1
+            or not stat.S_ISREG(path_stat.st_mode)
+            or path_stat.st_nlink != 1
             or (path_stat.st_dev, path_stat.st_ino) != expected_identity
         ):
             return None, "detection_error"
@@ -368,6 +375,7 @@ def _stable_bounded_read(
         descriptor_stat = os.fstat(descriptor)
         if (
             not stat.S_ISREG(descriptor_stat.st_mode)
+            or descriptor_stat.st_nlink != 1
             or (
                 descriptor_stat.st_dev,
                 descriptor_stat.st_ino,
@@ -389,8 +397,26 @@ def _stable_bounded_read(
             return None, "max_file_size"
         content = bytes(content_buffer)
 
+        final_descriptor_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(final_descriptor_stat.st_mode)
+            or final_descriptor_stat.st_nlink != 1
+            or (
+                final_descriptor_stat.st_dev,
+                final_descriptor_stat.st_ino,
+            )
+            != expected_identity
+        ):
+            return None, "detection_error"
+        final_resolved_target = target.resolve(strict=True)
+        if final_resolved_target != target or not final_resolved_target.is_relative_to(root):
+            return None, "detection_error"
         final_path_stat = target.stat(follow_symlinks=False)
-        if (final_path_stat.st_dev, final_path_stat.st_ino) != expected_identity:
+        if (
+            not stat.S_ISREG(final_path_stat.st_mode)
+            or final_path_stat.st_nlink != 1
+            or (final_path_stat.st_dev, final_path_stat.st_ino) != expected_identity
+        ):
             return None, "detection_error"
         return content, None
     except OSError:
@@ -443,7 +469,7 @@ def discover_sources(
             rejected.append(RejectedSource(relative_path, "symlink_escape"))
             continue
         target_relative_path = target.relative_to(root_path).as_posix()
-        if is_symlink:
+        if is_symlink or target != path:
             target_path_rule = _static_path_rule(target_relative_path, active_policy)
             if target_path_rule:
                 rejected.append(RejectedSource(relative_path, target_path_rule))
@@ -459,7 +485,7 @@ def discover_sources(
             elif git_status == "error":
                 rejected.append(RejectedSource(relative_path, "detection_error"))
                 continue
-            if is_symlink and git_available:
+            if (is_symlink or target != path) and git_available:
                 target_git_status = _git_ignore_status(root_path, target_relative_path)
                 if target_git_status == "ignored":
                     rejected.append(RejectedSource(relative_path, "git_ignored"))
@@ -470,8 +496,14 @@ def discover_sources(
                 elif target_git_status == "error":
                     rejected.append(RejectedSource(relative_path, "detection_error"))
                     continue
+        if stat.S_ISREG(target_stat.st_mode) and target_stat.st_nlink != 1:
+            rejected.append(RejectedSource(relative_path, "detection_error"))
+            continue
         content, read_rule = _stable_bounded_read(
-            target, target_stat, active_policy.max_file_size_bytes
+            target,
+            root_path,
+            target_stat,
+            active_policy.max_file_size_bytes,
         )
         if read_rule:
             rejected.append(RejectedSource(relative_path, read_rule))

@@ -311,6 +311,239 @@ def test_internal_symlink_is_allowed_when_alias_and_target_are_safe(tmp_path: Pa
     assert result.rejected == ()
 
 
+def test_regular_file_replaced_by_sensitive_symlink_rechecks_canonical_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    sensitive_content = b"path-classified private body"
+    candidate = _write(root, "docs/notes.md")
+    sensitive_target = _write(root, "config/secrets.json", sensitive_content)
+    original_is_symlink = Path.is_symlink
+    inspected: list[bytes] = []
+    replaced = False
+
+    def replace_after_regular_classification(path: Path) -> bool:
+        nonlocal replaced
+        was_symlink = original_is_symlink(path)
+        if path == candidate and not replaced:
+            candidate.unlink()
+            candidate.symlink_to(sensitive_target)
+            replaced = True
+        return was_symlink
+
+    original_looks_binary = source_discovery._looks_binary
+
+    def record_inspected_content(content: bytes) -> bool:
+        inspected.append(content)
+        return original_looks_binary(content)
+
+    monkeypatch.setattr(Path, "is_symlink", replace_after_regular_classification)
+    monkeypatch.setattr(source_discovery, "_looks_binary", record_inspected_content)
+
+    result = discover_sources(root, SourcePolicy(include_patterns=("**",)))
+
+    assert replaced
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("config/secrets.json", "secret_path"),
+        ("docs/notes.md", "secret_path"),
+    ]
+    assert inspected == []
+    assert sensitive_content.decode() not in repr(result)
+
+
+def test_parent_replaced_by_symlink_rechecks_target_include_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    approved_directory = root / "approved"
+    candidate = _write(root, "approved/notes.md")
+    target_content = b"outside candidate allowlist"
+    _write(root, "unapproved/notes.md", target_content)
+    parked_directory = root / "parked-approved"
+    original_is_symlink = Path.is_symlink
+    inspected: list[bytes] = []
+    replaced = False
+
+    def replace_parent_after_regular_classification(path: Path) -> bool:
+        nonlocal replaced
+        was_symlink = original_is_symlink(path)
+        if path == candidate and not replaced:
+            approved_directory.rename(parked_directory)
+            approved_directory.symlink_to(root / "unapproved", target_is_directory=True)
+            replaced = True
+        return was_symlink
+
+    original_looks_binary = source_discovery._looks_binary
+
+    def record_inspected_content(content: bytes) -> bool:
+        inspected.append(content)
+        return original_looks_binary(content)
+
+    monkeypatch.setattr(Path, "is_symlink", replace_parent_after_regular_classification)
+    monkeypatch.setattr(source_discovery, "_looks_binary", record_inspected_content)
+
+    result = discover_sources(root, SourcePolicy(include_patterns=("approved/**",)))
+
+    assert replaced
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("approved/notes.md", "not_in_allowlist"),
+        ("unapproved/notes.md", "not_in_allowlist"),
+    ]
+    assert inspected == []
+    assert target_content.decode() not in repr(result)
+
+
+def test_parent_replaced_by_symlink_rechecks_nested_git_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    approved_directory = root / "docs"
+    candidate = _write(root, "docs/notes.md")
+    metadata_content = b"nested repository private metadata"
+    metadata_directory = root / "metadata/.git"
+    _write(root, "metadata/.git/notes.md", metadata_content)
+    parked_directory = root / "parked-docs"
+    original_is_symlink = Path.is_symlink
+    inspected: list[bytes] = []
+    replaced = False
+
+    def replace_parent_after_regular_classification(path: Path) -> bool:
+        nonlocal replaced
+        was_symlink = original_is_symlink(path)
+        if path == candidate and not replaced:
+            approved_directory.rename(parked_directory)
+            approved_directory.symlink_to(metadata_directory, target_is_directory=True)
+            replaced = True
+        return was_symlink
+
+    original_looks_binary = source_discovery._looks_binary
+
+    def record_inspected_content(content: bytes) -> bool:
+        inspected.append(content)
+        return original_looks_binary(content)
+
+    monkeypatch.setattr(Path, "is_symlink", replace_parent_after_regular_classification)
+    monkeypatch.setattr(source_discovery, "_looks_binary", record_inspected_content)
+
+    result = discover_sources(root, SourcePolicy(include_patterns=("**",)))
+
+    assert replaced
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("docs/notes.md", "default_excluded_directory"),
+        ("metadata/.git/notes.md", "default_excluded_directory"),
+    ]
+    assert inspected == []
+    assert metadata_content.decode() not in repr(result)
+
+
+def test_regular_file_replaced_by_git_ignored_symlink_rechecks_canonical_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    gitignore_content = b"ignored/\n"
+    _write(root, ".gitignore", gitignore_content)
+    candidate = _write(root, "docs/notes.md")
+    ignored_content = b"ignored body must not be inspected"
+    ignored_target = _write(root, "ignored/notes.md", ignored_content)
+    original_is_symlink = Path.is_symlink
+    inspected: list[bytes] = []
+    replaced = False
+
+    def replace_after_regular_classification(path: Path) -> bool:
+        nonlocal replaced
+        was_symlink = original_is_symlink(path)
+        if path == candidate and not replaced:
+            candidate.unlink()
+            candidate.symlink_to(ignored_target)
+            replaced = True
+        return was_symlink
+
+    original_looks_binary = source_discovery._looks_binary
+
+    def record_inspected_content(content: bytes) -> bool:
+        inspected.append(content)
+        return original_looks_binary(content)
+
+    monkeypatch.setattr(Path, "is_symlink", replace_after_regular_classification)
+    monkeypatch.setattr(source_discovery, "_looks_binary", record_inspected_content)
+
+    result = discover_sources(
+        root,
+        SourcePolicy(include_patterns=("**",)),
+        repository=True,
+    )
+
+    assert replaced
+    assert result.relative_paths == (".gitignore",)
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("docs/notes.md", "git_ignored"),
+        ("ignored/notes.md", "git_ignored"),
+    ]
+    assert inspected == [gitignore_content]
+    assert ignored_content.decode() not in repr(result)
+
+
+def test_regular_source_hardlinked_to_sensitive_in_root_path_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sensitive_content = b"path-classified hardlink body must not be inspected"
+    sensitive_source = _write(tmp_path, "config/secrets.json", sensitive_content)
+    alias = tmp_path / "docs/alias.md"
+    alias.parent.mkdir()
+    alias.hardlink_to(sensitive_source)
+    original_looks_binary = source_discovery._looks_binary
+    inspected: list[bytes] = []
+
+    def record_inspected_content(content: bytes) -> bool:
+        inspected.append(content)
+        return original_looks_binary(content)
+
+    monkeypatch.setattr(source_discovery, "_looks_binary", record_inspected_content)
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("**",)))
+
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("config/secrets.json", "secret_path"),
+        ("docs/alias.md", "detection_error"),
+    ]
+    assert inspected == []
+    assert sensitive_content.decode() not in repr(result)
+
+
+def test_regular_source_with_outside_root_hardlink_alias_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    outside_content = b"outside hardlink body must not be inspected"
+    outside_source = _write(tmp_path, "outside/notes.md", outside_content)
+    alias = root / "docs/alias.md"
+    alias.parent.mkdir()
+    alias.hardlink_to(outside_source)
+    original_looks_binary = source_discovery._looks_binary
+    inspected: list[bytes] = []
+
+    def record_inspected_content(content: bytes) -> bool:
+        inspected.append(content)
+        return original_looks_binary(content)
+
+    monkeypatch.setattr(source_discovery, "_looks_binary", record_inspected_content)
+
+    result = discover_sources(root, SourcePolicy(include_patterns=("**",)))
+
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("docs/alias.md", "detection_error"),
+    ]
+    assert inspected == []
+    assert outside_content.decode() not in repr(result)
+
+
 def test_alias_swap_after_validation_consumes_the_inspected_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -356,12 +589,11 @@ def test_alias_swap_after_validation_consumes_the_inspected_bytes(
     assert outside_content.decode() not in repr(result)
 
 
-def test_parent_replacement_and_hardlink_identity_trick_cannot_change_consumed_bytes(
+def test_parent_replacement_hardlink_identity_trick_fails_closed_before_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "root"
-    approved_content = b"approved bytes inspected under policy"
-    outside_content = b"outside replacement must never be consumed"
+    approved_content = b"multiply linked body must not be inspected"
     target = _write(root, "docs/notes.md", approved_content)
     approved_directory = root / "docs"
     parked_directory = root / "parked-docs"
@@ -392,17 +624,14 @@ def test_parent_replacement_and_hardlink_identity_trick_cannot_change_consumed_b
     monkeypatch.setattr(source_discovery, "_generated_content_rule", record_final_content_check)
 
     result = discover_sources(root, SourcePolicy(include_patterns=("docs/**",)))
-    outside_hardlink.unlink()
-    outside_hardlink.write_bytes(outside_content)
 
-    assert replaced_parent
-    assert (root / "docs/notes.md").read_bytes() == outside_content
-    assert result.relative_paths == ("docs/notes.md",)
-    assert result.sources[0].relative_path == "docs/notes.md"
-    assert inspected == [approved_content]
-    assert result.sources[0].content == inspected[0]
-    assert result.sources[0].content != outside_content
-    assert outside_content.decode() not in repr(result)
+    assert not replaced_parent
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("docs/notes.md", "detection_error"),
+    ]
+    assert inspected == []
+    assert approved_content.decode() not in repr(result)
 
 
 def test_regular_file_parent_replaced_after_canonicalization_does_not_read_outside(
