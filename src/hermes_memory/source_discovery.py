@@ -1,4 +1,5 @@
 """Safe, deterministic source-file discovery for document ingestion."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -81,7 +82,9 @@ class DiscoveryResult:
 
 def _matches(path: str, patterns: Iterable[str]) -> bool:
     for pattern in patterns:
-        normalized = pattern.replace("\\", "/").lstrip("./")
+        normalized = pattern.replace("\\", "/")
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
         if fnmatchcase(path, normalized):
             return True
         if normalized.startswith("**/") and fnmatchcase(path, normalized[3:]):
@@ -138,6 +141,12 @@ def _is_secret_path(relative_path: str) -> bool:
     if name in {"auth.json", "session.json", "token.json", "tokens.json"}:
         return True
 
+    stem_tokens = _filename_tokens(Path(raw_name).stem)
+    if (len(stem_tokens) == 1 and stem_tokens[0] in {"secret", "secrets"}) or (
+        len(stem_tokens) == 2 and stem_tokens[0] == "api" and stem_tokens[1] in {"key", "keys"}
+    ):
+        return True
+
     tokens = _filename_tokens(raw_name)
     if any(token in {"credential", "credentials"} for token in tokens):
         return True
@@ -166,12 +175,22 @@ def _path_category_rule(relative_path: str) -> str | None:
         "generated" in directories
         or name.startswith("generated.")
         or ".generated." in name
+        or ".gen." in name
+        or ".designer." in name
+        or re.search(r"_pb2(?:_grpc)?\.[^.]+$", name)
         or generated_stem.endswith(("_generated", "-generated"))
         or name.endswith(".pb.go")
     ):
         return "generated_file"
     if name.endswith(".lock") or name in COMMON_LOCK_FILE_NAMES:
         return "lock_file"
+    checksum_suffixes = {".md5", ".sha1", ".sha224", ".sha256", ".sha384", ".sha512", ".sum"}
+    if (
+        Path(name).suffix in checksum_suffixes
+        or name in {"checksum.txt", "checksums.txt"}
+        or re.fullmatch(r"(?:md5|sha(?:1|224|256|384|512))sums(?:\.txt)?", name)
+    ):
+        return "checksum_file"
     if _is_secret_path(relative_path):
         return "secret_path"
 
@@ -179,39 +198,55 @@ def _path_category_rule(relative_path: str) -> str | None:
     source_tree_roots = {"src", "source", "lib", "app", "packages", "tests", "test"}
     private_categories = {
         "private",
-        "clients",
         "client-corpus",
         "client-corpora",
         "private-corpus",
         "private-corpora",
     }
-    legitimate_client_source = top in source_tree_roots and "client" in directories
+    client_directories = {"client", "clients"}
+    legitimate_client_source = top in source_tree_roots and any(
+        part in client_directories for part in directories
+    )
     if any(part in private_categories for part in directories) or (
-        "client" in directories and not legitimate_client_source
+        any(part in client_directories for part in directories) and not legitimate_client_source
     ):
         return "private_corpus_path"
 
     sensitive_segments = PERSONAL_PATH_CATEGORIES.intersection(directories)
     legitimate_identity_source = sensitive_segments == {"identity"} and top in source_tree_roots
     if (sensitive_segments and not legitimate_identity_source) or any(
-        part.startswith("personal-")
-        and part.removeprefix("personal-") in PERSONAL_PATH_CATEGORIES
+        part.startswith("personal-") and part.removeprefix("personal-") in PERSONAL_PATH_CATEGORIES
         for part in directories
     ):
         return "sensitive_personal_path"
 
-    raw_categories = {"raw-chat", "raw-chats", "raw-transcript", "raw-transcripts"}
+    raw_categories = {
+        "raw-chat",
+        "raw-chats",
+        "raw-transcript",
+        "raw-transcripts",
+        "raw-conversation",
+        "raw-conversations",
+    }
     transcript_tokens = _filename_tokens(path.stem)
     transcript_names = {"transcript", "transcripts", "conversation", "conversations"}
+    chat_names = {"chat", "chats"}
+    raw_record_names = transcript_names | chat_names
     raw_export_suffixes = {".json", ".jsonl", ".ndjson", ".csv", ".txt", ".sqlite", ".db"}
+    single_record_export = len(transcript_tokens) == 1 and transcript_tokens[0] in raw_record_names
+    chat_transcript_export = bool(chat_names.intersection(transcript_tokens)) and bool(
+        {"transcript", "transcripts"}.intersection(transcript_tokens)
+    )
+    named_record_export = "export" in transcript_tokens and bool(
+        raw_record_names.intersection(transcript_tokens)
+    )
     raw_export_name = path.suffix.lower() in raw_export_suffixes and (
-        (len(transcript_tokens) == 1 and transcript_tokens[0] in transcript_names)
-        or {"chat", "transcript"}.issubset(transcript_tokens)
+        single_record_export or chat_transcript_export or named_record_export
     )
     if (
         any(part in raw_categories for part in directories)
         or any(
-            left == "raw" and right in {"chat", "chats", "transcript", "transcripts"}
+            left == "raw" and right in raw_record_names
             for left, right in zip(directories, directories[1:])
         )
         or raw_export_name
@@ -241,8 +276,12 @@ def _secret_content_rule(content: bytes) -> str | None:
         return "service_account_json"
     token_assignment = re.compile(
         rb"^[ \t]*(?:export[ \t]+)?[\"']?"
-        rb"(?:api[_-]?key|(?:api|access|auth|refresh)?[_-]?token|client[_-]?secret|password)"
-        rb"[\"']?[ \t]*[:=][ \t]*[\"']?[A-Za-z0-9_./+\-=]{12,}",
+        rb"(?:api[_-]?key|(?:[A-Za-z0-9]+[_-]+)*(?:token|password)|"
+        rb"(?:[A-Za-z0-9]+[_-]+)*secret(?:[_-]+access)?[_-]+key|"
+        rb"private[_-]+key|client[_-]+secret)"
+        rb"[\"']?[ \t]*[:=][ \t]*"
+        rb"(?:(?P<quote>[\"'])[A-Za-z0-9_./+\-=]{12,}(?P=quote)|"
+        rb"[A-Za-z0-9_./+\-=]{12,})[ \t]*,?[ \t]*(?:[#;][^\r\n]*)?$",
         re.IGNORECASE | re.MULTILINE,
     )
     if token_assignment.search(content):
@@ -253,7 +292,10 @@ def _secret_content_rule(content: bytes) -> str | None:
 def _generated_content_rule(content: bytes) -> str | None:
     header = content[:8192]
     if re.search(
-        rb"(?:@generated\b|\bcode generated\b[^\r\n]*\bdo not edit\b)",
+        rb"(?:@generated\b|<auto-generated\s*/?>|"
+        rb"(?:\bcode generated\b|\b(?:this )?file (?:is |was )?"
+        rb"(?:automatically )?generated\b|\bgenerated file\b)"
+        rb"[^\r\n]*\bdo not edit\b)",
         header,
         re.IGNORECASE,
     ):
@@ -284,9 +326,7 @@ def discover_sources(
     rejected: list[RejectedSource] = []
     warnings: list[str] = []
 
-    candidates = (
-        item for item in root_path.rglob("*") if item.is_file() or item.is_symlink()
-    )
+    candidates = (item for item in root_path.rglob("*") if item.is_file() or item.is_symlink())
     for path in sorted(candidates, key=str):
         relative_path = path.relative_to(root_path).as_posix()
         if is_repository and relative_path.startswith(".git/"):
@@ -299,7 +339,9 @@ def discover_sources(
         if _matches(relative_path, active_policy.exclude_patterns):
             rejected.append(RejectedSource(relative_path, "exclude_pattern"))
             continue
-        if any(part in DEFAULT_EXCLUDED_DIRECTORIES for part in Path(relative_path).parts[:-1]):
+        if any(
+            part.lower() in DEFAULT_EXCLUDED_DIRECTORIES for part in Path(relative_path).parts[:-1]
+        ):
             rejected.append(RejectedSource(relative_path, "default_excluded_directory"))
             continue
         path_rule = _path_category_rule(relative_path)
