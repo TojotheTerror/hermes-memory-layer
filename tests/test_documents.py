@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_memory.config import load_config
 from hermes_memory.documents import (
     AtomicUnit,
     DocumentChunk,
@@ -15,6 +16,119 @@ from hermes_memory.documents import (
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "obsidian" / "Operations" / "agent-memory.md"
+
+
+def test_document_embedding_defaults_do_not_migrate_memory_bank(monkeypatch):
+    for variable in (
+        "MEMORY_EMBEDDING_MODEL",
+        "DOCUMENT_EMBEDDING_MODEL",
+        "DOCUMENT_EMBEDDING_DIMENSIONS",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    config = load_config(project="test-project")
+
+    assert config.embedding_model == "text-embedding-005"
+    assert config.document_embedding_model == "gemini-embedding-001"
+    assert config.document_embedding_dimensions == 768
+
+
+def test_document_ingestion_defaults_match_the_plan(monkeypatch):
+    for variable in (
+        "DOCUMENT_CHUNK_MIN_TOKENS",
+        "DOCUMENT_CHUNK_TARGET_TOKENS",
+        "DOCUMENT_CHUNK_MAX_TOKENS",
+        "DOCUMENT_CHUNK_OVERLAP_TOKENS",
+        "DOCUMENT_EMBEDDING_CONCURRENCY",
+        "DOCUMENT_TOP_K",
+        "DOCUMENT_CONTEXT_CHAR_LIMIT",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+    config = load_config(project="test-project")
+
+    assert config.chunk_min_tokens == 250
+    assert config.chunk_target_tokens == 600
+    assert config.chunk_max_tokens == 900
+    assert config.chunk_overlap_tokens == 80
+    assert config.embedding_concurrency == 4
+    assert config.document_top_k == 4
+    assert config.document_context_char_limit == 8_000
+
+
+def test_document_ingestion_settings_load_from_document_environment(monkeypatch):
+    environment = {
+        "DOCUMENT_EMBEDDING_MODEL": "custom-document-model",
+        "DOCUMENT_EMBEDDING_DIMENSIONS": "256",
+        "DOCUMENT_CHUNK_MIN_TOKENS": "100",
+        "DOCUMENT_CHUNK_TARGET_TOKENS": "200",
+        "DOCUMENT_CHUNK_MAX_TOKENS": "300",
+        "DOCUMENT_CHUNK_OVERLAP_TOKENS": "50",
+        "DOCUMENT_EMBEDDING_CONCURRENCY": "2",
+        "DOCUMENT_TOP_K": "7",
+        "DOCUMENT_CONTEXT_CHAR_LIMIT": "1234",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    config = load_config(project="test-project")
+
+    assert config.document_embedding_model == "custom-document-model"
+    assert config.document_embedding_dimensions == 256
+    assert config.chunk_min_tokens == 100
+    assert config.chunk_target_tokens == 200
+    assert config.chunk_max_tokens == 300
+    assert config.chunk_overlap_tokens == 50
+    assert config.embedding_concurrency == 2
+    assert config.document_top_k == 7
+    assert config.document_context_char_limit == 1234
+
+
+def test_document_chunk_minimum_cannot_exceed_target():
+    with pytest.raises(
+        ValueError,
+        match="chunk_min_tokens must be less than or equal to chunk_target_tokens",
+    ):
+        load_config(project="test-project", chunk_min_tokens=601)
+
+
+def test_document_chunk_target_cannot_exceed_maximum():
+    with pytest.raises(
+        ValueError,
+        match="chunk_target_tokens must be less than or equal to chunk_max_tokens",
+    ):
+        load_config(project="test-project", chunk_target_tokens=901)
+
+
+def test_document_chunk_overlap_must_be_less_than_minimum():
+    with pytest.raises(
+        ValueError,
+        match="chunk_overlap_tokens must be less than chunk_min_tokens",
+    ):
+        load_config(project="test-project", chunk_overlap_tokens=250)
+
+
+@pytest.mark.parametrize("invalid_dimensions", ["0", "-1"])
+def test_document_embedding_dimensions_from_environment_must_be_positive(
+    monkeypatch, invalid_dimensions
+):
+    monkeypatch.setenv("DOCUMENT_EMBEDDING_DIMENSIONS", invalid_dimensions)
+
+    with pytest.raises(
+        ValueError,
+        match="document_embedding_dimensions must be greater than zero",
+    ):
+        load_config(project="test-project")
+
+
+def test_explicit_zero_document_embedding_dimensions_is_not_replaced(monkeypatch):
+    monkeypatch.delenv("DOCUMENT_EMBEDDING_DIMENSIONS", raising=False)
+
+    with pytest.raises(
+        ValueError,
+        match="document_embedding_dimensions must be greater than zero",
+    ):
+        load_config(project="test-project", document_embedding_dimensions=0)
 
 
 def _source_with_metadata(metadata):
