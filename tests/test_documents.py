@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_memory.config import load_config
+from hermes_memory.config import HermesMemoryConfig, load_config
 from hermes_memory.documents import (
     AtomicUnit,
     DocumentChunk,
@@ -84,6 +84,44 @@ def test_document_ingestion_settings_load_from_document_environment(monkeypatch)
     assert config.document_context_char_limit == 1234
 
 
+@pytest.mark.parametrize(
+    ("setting", "environment", "environment_value", "expected"),
+    [
+        ("document_embedding_model", "DOCUMENT_EMBEDDING_MODEL", "env-model", "env-model"),
+        ("document_embedding_dimensions", "DOCUMENT_EMBEDDING_DIMENSIONS", "256", 256),
+        ("chunk_min_tokens", "DOCUMENT_CHUNK_MIN_TOKENS", "200", 200),
+        ("chunk_target_tokens", "DOCUMENT_CHUNK_TARGET_TOKENS", "500", 500),
+        ("chunk_max_tokens", "DOCUMENT_CHUNK_MAX_TOKENS", "1000", 1000),
+        ("chunk_overlap_tokens", "DOCUMENT_CHUNK_OVERLAP_TOKENS", "70", 70),
+        ("embedding_concurrency", "DOCUMENT_EMBEDDING_CONCURRENCY", "2", 2),
+        ("document_top_k", "DOCUMENT_TOP_K", "3", 3),
+        ("document_context_char_limit", "DOCUMENT_CONTEXT_CHAR_LIMIT", "7000", 7000),
+    ],
+)
+@pytest.mark.parametrize("invalid_override", [None, ""])
+def test_explicit_invalid_document_override_does_not_fall_back_to_environment(
+    monkeypatch, setting, environment, environment_value, expected, invalid_override
+):
+    monkeypatch.setenv(environment, environment_value)
+
+    config = load_config(project="test-project")
+    assert getattr(config, setting) == expected
+
+    with pytest.raises(ValueError, match=setting):
+        load_config(project="test-project", **{setting: invalid_override})
+
+
+@pytest.mark.parametrize("empty_override", [None, ""])
+def test_legacy_embedding_model_empty_override_keeps_existing_precedence(
+    monkeypatch, empty_override
+):
+    monkeypatch.setenv("MEMORY_EMBEDDING_MODEL", "legacy-env-model")
+
+    config = load_config(project="test-project", embedding_model=empty_override)
+
+    assert config.embedding_model == "legacy-env-model"
+
+
 def test_document_chunk_minimum_cannot_exceed_target():
     with pytest.raises(
         ValueError,
@@ -129,6 +167,79 @@ def test_explicit_zero_document_embedding_dimensions_is_not_replaced(monkeypatch
         match="document_embedding_dimensions must be greater than zero",
     ):
         load_config(project="test-project", document_embedding_dimensions=0)
+
+
+DOCUMENT_NUMERIC_SETTINGS = (
+    "document_embedding_dimensions",
+    "chunk_min_tokens",
+    "chunk_target_tokens",
+    "chunk_max_tokens",
+    "chunk_overlap_tokens",
+    "embedding_concurrency",
+    "document_top_k",
+    "document_context_char_limit",
+)
+
+
+@pytest.mark.parametrize("setting", DOCUMENT_NUMERIC_SETTINGS)
+@pytest.mark.parametrize("invalid_value", [True, "1"])
+def test_direct_document_numeric_settings_require_actual_integers(setting, invalid_value):
+    with pytest.raises(TypeError, match=rf"{setting} must be an integer"):
+        HermesMemoryConfig(project="test-project", **{setting: invalid_value})
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "document_embedding_dimensions",
+        "chunk_min_tokens",
+        "chunk_target_tokens",
+        "chunk_max_tokens",
+        "embedding_concurrency",
+        "document_top_k",
+        "document_context_char_limit",
+    ],
+)
+@pytest.mark.parametrize("invalid_value", [0, -1])
+def test_direct_positive_document_numeric_settings_reject_non_positive_values(
+    setting, invalid_value
+):
+    with pytest.raises(ValueError, match=rf"{setting} must be greater than zero"):
+        HermesMemoryConfig(project="test-project", **{setting: invalid_value})
+
+
+def test_direct_document_chunk_overlap_rejects_negative_values():
+    with pytest.raises(ValueError, match="chunk_overlap_tokens must be non-negative"):
+        HermesMemoryConfig(project="test-project", chunk_overlap_tokens=-1)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {"chunk_min_tokens": 601},
+            "chunk_min_tokens must be less than or equal to chunk_target_tokens",
+        ),
+        (
+            {"chunk_target_tokens": 901},
+            "chunk_target_tokens must be less than or equal to chunk_max_tokens",
+        ),
+        (
+            {"chunk_overlap_tokens": 250},
+            "chunk_overlap_tokens must be less than chunk_min_tokens",
+        ),
+    ],
+)
+def test_direct_document_chunk_relationships_are_validated(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        HermesMemoryConfig(project="test-project", **overrides)
+
+
+def test_direct_document_config_defaults_are_valid():
+    config = HermesMemoryConfig(project="test-project")
+
+    assert config.chunk_min_tokens <= config.chunk_target_tokens <= config.chunk_max_tokens
+    assert 0 <= config.chunk_overlap_tokens < config.chunk_min_tokens
 
 
 def _source_with_metadata(metadata):
