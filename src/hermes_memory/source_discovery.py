@@ -25,6 +25,20 @@ DEFAULT_EXCLUDED_DIRECTORIES = frozenset(
     }
 )
 
+COMMON_LOCK_FILE_NAMES = frozenset(
+    {
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "pnpm-lock.yaml",
+        "bun.lock",
+        "bun.lockb",
+    }
+)
+
+PERSONAL_PATH_CATEGORIES = frozenset(
+    {"finance", "tax", "taxes", "medical", "household", "identity", "legal"}
+)
+
 
 @dataclass(frozen=True)
 class SourcePolicy:
@@ -94,7 +108,7 @@ def _git_ignore_status(
 
 def _is_secret_path(relative_path: str) -> bool:
     name = Path(relative_path).name.lower()
-    if name == ".env" or name.startswith(".env."):
+    if name.startswith(".env"):
         return True
     if name in {
         ".netrc",
@@ -104,9 +118,16 @@ def _is_secret_path(relative_path: str) -> bool:
         "id_dsa",
         "id_ecdsa",
         "id_ed25519",
+        "private-key",
+        "private_key",
+        "privatekey",
     }:
         return True
+    if re.fullmatch(r"ssh_host_(?:rsa|dsa|ecdsa|ed25519)_key", name):
+        return True
     if Path(name).suffix in {".key", ".pem", ".p12", ".pfx"}:
+        return True
+    if name in {"auth.json", "session.json", "token.json", "tokens.json"}:
         return True
     markers = (
         "credential",
@@ -118,8 +139,51 @@ def _is_secret_path(relative_path: str) -> bool:
         "access_token",
         "token-dump",
         "token_dump",
+        "config-export",
+        "config_export",
+        "configuration-export",
+        "configuration_export",
     )
     return any(marker in name for marker in markers)
+
+
+def _path_category_rule(relative_path: str) -> str | None:
+    path = Path(relative_path)
+    name = path.name.lower()
+    directories = tuple(part.lower().replace("_", "-") for part in path.parts[:-1])
+
+    if "generated" in directories or name.startswith("generated.") or ".generated." in name:
+        return "generated_file"
+    if name.endswith(".lock") or name in COMMON_LOCK_FILE_NAMES:
+        return "lock_file"
+    if _is_secret_path(relative_path):
+        return "secret_path"
+
+    top = directories[0] if directories else ""
+    if top in {"private", "client", "clients"} or any(
+        part in {"client-corpus", "client-corpora", "private-corpus", "private-corpora"}
+        for part in directories
+    ):
+        return "private_corpus_path"
+
+    if top in PERSONAL_PATH_CATEGORIES or (
+        top == "personal"
+        and len(directories) > 1
+        and directories[1] in PERSONAL_PATH_CATEGORIES
+    ) or any(
+        part.startswith("personal-")
+        and part.removeprefix("personal-") in PERSONAL_PATH_CATEGORIES
+        for part in directories
+    ):
+        return "sensitive_personal_path"
+
+    raw_categories = {"raw-chat", "raw-chats", "raw-transcript", "raw-transcripts"}
+    if any(part in raw_categories for part in directories) or any(
+        left == "raw" and right in {"chat", "chats", "transcript", "transcripts"}
+        for left, right in zip(directories, directories[1:])
+    ):
+        return "raw_transcript_path"
+    return None
 
 
 def _looks_binary(content: bytes) -> bool:
@@ -187,8 +251,9 @@ def discover_sources(
         if any(part in DEFAULT_EXCLUDED_DIRECTORIES for part in Path(relative_path).parts[:-1]):
             rejected.append(RejectedSource(relative_path, "default_excluded_directory"))
             continue
-        if _is_secret_path(relative_path):
-            rejected.append(RejectedSource(relative_path, "secret_path"))
+        path_rule = _path_category_rule(relative_path)
+        if path_rule:
+            rejected.append(RejectedSource(relative_path, path_rule))
             continue
         if path.is_symlink():
             try:

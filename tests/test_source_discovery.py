@@ -162,10 +162,68 @@ def test_file_larger_than_policy_limit_is_rejected(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "relative_path",
     (
+        "generated.pb.go",
+        "api.generated.ts",
+        "generated/client.py",
+    ),
+)
+def test_generated_files_are_rejected(tmp_path: Path, relative_path: str) -> None:
+    _write(tmp_path, relative_path)
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("**",)))
+
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        (relative_path, "generated_file"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "Pipfile.lock",
+        "Cargo.lock",
+        "Gemfile.lock",
+        "composer.lock",
+        "uv.lock",
+        "bun.lockb",
+    ),
+)
+def test_common_lock_files_are_rejected(tmp_path: Path, relative_path: str) -> None:
+    _write(tmp_path, relative_path)
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("**",)))
+
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        (relative_path, "lock_file"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
         ".env",
+        ".envrc",
         "config/.env.local",
+        "config/.env.test.local",
+        "config/.env-example",
         "keys/id_rsa",
+        "keys/private-key",
+        "keys/private_key",
+        "keys/privatekey",
+        "keys/ssh_host_ed25519_key",
+        "config/auth.json",
+        "sessions/session.json",
+        "exports/token.json",
         "config/credentials.json",
+        "exports/config-export.json",
+        "exports/configuration_export.yaml",
         "exports/service-account.json",
         "sessions/auth-token.txt",
     ),
@@ -179,6 +237,62 @@ def test_secret_path_is_rejected(tmp_path: Path, relative_path: str) -> None:
     assert [(item.path, item.rule) for item in result.rejected] == [
         (relative_path, "secret_path"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "expected_rule"),
+    (
+        ("Private/corpus.md", "private_corpus_path"),
+        ("Clients/acme/brief.md", "private_corpus_path"),
+        ("client-corpora/acme/brief.md", "private_corpus_path"),
+        ("Personal/Finance/budget.md", "sensitive_personal_path"),
+        ("Personal/Tax/return.md", "sensitive_personal_path"),
+        ("Personal/Medical/history.md", "sensitive_personal_path"),
+        ("Personal/Household/inventory.md", "sensitive_personal_path"),
+        ("Personal/Identity/passport.md", "sensitive_personal_path"),
+        ("Personal/Legal/will.md", "sensitive_personal_path"),
+        ("personal-finance/accounts.md", "sensitive_personal_path"),
+        ("raw-chat/export.json", "raw_transcript_path"),
+        ("raw-transcripts/bulk.json", "raw_transcript_path"),
+        ("Raw/Transcripts/archive.json", "raw_transcript_path"),
+    ),
+)
+def test_denied_corpus_path_categories_are_rejected(
+    tmp_path: Path, relative_path: str, expected_rule: str
+) -> None:
+    _write(tmp_path, relative_path)
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("**",)))
+
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        (relative_path, expected_rule),
+    ]
+    assert vars(result.rejected[0]) == {"path": relative_path, "rule": expected_rule}
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "docs/authentication.json",
+        "docs/session-guide.json",
+        "docs/tokenization.json",
+        "docs/generated-code.md",
+        "docs/package-locking-guide.md",
+        "docs/legalese.md",
+        "docs/taxonomy.md",
+        "docs/transcript-guide.md",
+        "src/client/request.py",
+        "src/identity/model.py",
+    ),
+)
+def test_safe_path_lookalikes_are_not_overblocked(tmp_path: Path, relative_path: str) -> None:
+    _write(tmp_path, relative_path)
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("**",)))
+
+    assert result.relative_paths == (relative_path,)
+    assert result.rejected == ()
 
 
 def test_private_key_header_is_rejected_without_content_disclosure(tmp_path: Path) -> None:
