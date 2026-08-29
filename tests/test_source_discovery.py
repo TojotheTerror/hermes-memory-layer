@@ -1,0 +1,232 @@
+from pathlib import Path
+import subprocess
+
+import pytest
+
+import hermes_memory.source_discovery as source_discovery
+from hermes_memory.source_discovery import SourcePolicy, discover_sources
+
+
+def _write(root: Path, relative_path: str, content: bytes = b"safe text") -> Path:
+    path = root / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+def test_repeatable_include_and_exclude_globs_are_allowlist_first(tmp_path: Path) -> None:
+    _write(tmp_path, "Operations/runbook.md")
+    _write(tmp_path, "Models/guide.md")
+    _write(tmp_path, "Models/private/notes.md")
+    _write(tmp_path, "Personal/journal.md")
+
+    result = discover_sources(
+        tmp_path,
+        SourcePolicy(
+            include_patterns=("Operations/**", "Models/**"),
+            exclude_patterns=("**/private/**", "**/*.tmp"),
+        ),
+    )
+
+    assert result.relative_paths == ("Models/guide.md", "Operations/runbook.md")
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("Models/private/notes.md", "exclude_pattern"),
+        ("Personal/journal.md", "not_in_allowlist"),
+    ]
+
+
+def test_apply_requires_include_patterns_or_allow_all_approval(tmp_path: Path) -> None:
+    _write(tmp_path, "approved.md")
+
+    with pytest.raises(ValueError, match="include pattern"):
+        discover_sources(tmp_path, SourcePolicy(), for_apply=True)
+
+    result = discover_sources(
+        tmp_path,
+        SourcePolicy(allow_all_approved=True),
+        for_apply=True,
+    )
+    assert result.relative_paths == ("approved.md",)
+
+
+def test_default_excluded_directories_are_rejected(tmp_path: Path) -> None:
+    excluded_directories = (
+        ".git",
+        ".obsidian",
+        ".trash",
+        "node_modules",
+        "vendor",
+        ".venv",
+        "build",
+        "dist",
+        "cache",
+    )
+    for directory in excluded_directories:
+        _write(tmp_path, f"{directory}/nested/source.md")
+    _write(tmp_path, "z-safe.md")
+    _write(tmp_path, "a-safe.md")
+
+    result = discover_sources(
+        tmp_path,
+        SourcePolicy(include_patterns=("**",)),
+    )
+
+    assert result.relative_paths == ("a-safe.md", "z-safe.md")
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        (f"{directory}/nested/source.md", "default_excluded_directory")
+        for directory in sorted(excluded_directories)
+    ]
+
+
+def test_repository_discovery_rejects_git_ignored_files(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    _write(tmp_path, ".gitignore", b"ignored.md\nignored-dir/\n")
+    _write(tmp_path, "ignored.md")
+    _write(tmp_path, "ignored-dir/nested.md")
+    _write(tmp_path, "kept.md")
+
+    result = discover_sources(
+        tmp_path,
+        SourcePolicy(include_patterns=("**",)),
+        repository=True,
+    )
+
+    assert result.relative_paths == (".gitignore", "kept.md")
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("ignored-dir/nested.md", "git_ignored"),
+        ("ignored.md", "git_ignored"),
+    ]
+
+
+def test_missing_git_uses_static_fallback_with_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(tmp_path, "kept.md")
+
+    def missing_git(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise FileNotFoundError("git executable missing")
+
+    monkeypatch.setattr(source_discovery.subprocess, "run", missing_git)
+
+    result = discover_sources(
+        tmp_path,
+        SourcePolicy(include_patterns=("**",)),
+        repository=True,
+    )
+
+    assert result.relative_paths == ("kept.md",)
+    assert result.warnings == (
+        "git check-ignore unavailable; static exclusions only",
+    )
+
+
+def test_symlink_that_escapes_root_is_rejected(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = _write(tmp_path, "outside.md")
+    (root / "escape.md").symlink_to(outside)
+
+    result = discover_sources(root, SourcePolicy(include_patterns=("**",)))
+
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("escape.md", "symlink_escape"),
+    ]
+
+
+def test_binary_file_is_rejected(tmp_path: Path) -> None:
+    _write(tmp_path, "image.bin", b"text prefix\x00binary payload")
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("**",)))
+
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("image.bin", "binary_content"),
+    ]
+
+
+def test_file_larger_than_policy_limit_is_rejected(tmp_path: Path) -> None:
+    _write(tmp_path, "large.md", b"12345")
+
+    result = discover_sources(
+        tmp_path,
+        SourcePolicy(include_patterns=("**",), max_file_size_bytes=4),
+    )
+
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("large.md", "max_file_size"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        ".env",
+        "config/.env.local",
+        "keys/id_rsa",
+        "config/credentials.json",
+        "exports/service-account.json",
+        "sessions/auth-token.txt",
+    ),
+)
+def test_secret_path_is_rejected(tmp_path: Path, relative_path: str) -> None:
+    _write(tmp_path, relative_path)
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("**",)))
+
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        (relative_path, "secret_path"),
+    ]
+
+
+def test_private_key_header_is_rejected_without_content_disclosure(tmp_path: Path) -> None:
+    marker = "-----BEGIN FAKE PRIVATE KEY-----"
+    _write(tmp_path, "notes.md", f"heading\n{marker}\n".encode())
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("**",)))
+
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("notes.md", "private_key_header"),
+    ]
+    assert marker not in repr(result)
+    assert vars(result.rejected[0]) == {
+        "path": "notes.md",
+        "rule": "private_key_header",
+    }
+
+
+def test_obvious_token_assignment_is_rejected_without_value_disclosure(tmp_path: Path) -> None:
+    fake_value = "FAKE_TOKEN_VALUE_123456"
+    _write(tmp_path, "settings.txt", f'api_token = "{fake_value}"\n'.encode())
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("**",)))
+
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("settings.txt", "token_assignment"),
+    ]
+    assert fake_value not in repr(result)
+
+
+def test_detector_error_rejects_only_that_file_and_discovery_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(tmp_path, "broken.md", b"detector trigger")
+    _write(tmp_path, "safe.md", b"ordinary content")
+    original_detector = source_discovery._secret_content_rule
+
+    def unreliable_detector(content: bytes) -> str | None:
+        if content == b"detector trigger":
+            raise RuntimeError("detector unavailable")
+        return original_detector(content)
+
+    monkeypatch.setattr(source_discovery, "_secret_content_rule", unreliable_detector)
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("**",)))
+
+    assert result.relative_paths == ("safe.md",)
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("broken.md", "detection_error"),
+    ]
