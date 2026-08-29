@@ -32,10 +32,10 @@ def test_document_identity_and_line_ranges_are_deterministic():
         chunk_content_hash=chunk_hash,
     )
 
-    assert corpus_id == "c4d4d74effa2400fe746960b"
-    assert source_id == "e0d9feb51baa7d2f42531c7a2d75babd"
+    assert corpus_id == "c416ede961f0b85fc12c92b1"
+    assert source_id == "4c0bb7b789d123575f02b4d5438d52d2"
     assert chunk_hash == "6a4d4262f0306776db47a645c6aded1e335074810a37200613315c74b251e397"
-    assert chunk_id == "19fe8cd8dec3329177c811bbaa0ccb0d22fb7712"
+    assert chunk_id == "f736d84d5f1f7f7db03941e68d5ba1ba6a6655d3"
     assert sha256_text(chunk_text.replace("\n", "\r\n")) == chunk_hash
 
     source = SourceDocument(
@@ -75,6 +75,7 @@ def test_document_identity_and_line_ranges_are_deterministic():
     )
 
     assert (chunk.start_line, chunk.end_line) == (30, 38)
+    assert chunk.citation == "Operations/agent-memory.md#L30-L38"
     assert lines[chunk.start_line - 1] == "### Recovery"
     assert lines[chunk.end_line - 1].startswith("A successful recovery")
     with pytest.raises(FrozenInstanceError):

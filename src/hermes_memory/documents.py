@@ -67,7 +67,7 @@ def sha256_text(text: str) -> str:
 
 
 def _sha256_parts(*parts: str) -> str:
-    return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
+    return hashlib.sha256("".join(parts).encode("utf-8")).hexdigest()
 
 
 def _normalize_path(value: str) -> str:
