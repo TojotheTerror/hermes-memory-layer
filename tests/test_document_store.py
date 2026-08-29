@@ -284,6 +284,54 @@ def test_search_document_chunks_uses_direct_base_table_query(monkeypatch):
     assert "filtered_chunks" not in base_query
 
 
+def test_search_document_chunks_keeps_vector_search_base_columns_unaliased(monkeypatch):
+    client = _FakeSearchClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(
+        project="test-project",
+        bq_dataset="test_dataset",
+        document_embedding_model="test-model",
+        document_embedding_dimensions=3,
+    )
+
+    bigquery_store.search_document_chunks(
+        [0.25, -0.5, 1],
+        user_id="user",
+        agent_name="agent",
+        cfg=cfg,
+    )
+
+    sql = client.queries[0][0]
+    sql_shape = re.search(
+        r"SELECT(?P<outer_projection>.*?)FROM\s+VECTOR_SEARCH\(\s*"
+        r"\(\s*SELECT(?P<base_projection>.*?)FROM\s+"
+        r"`test-project\.test_dataset\.document_chunks`\s+AS\s+chunks\s+WHERE\b",
+        sql,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    assert sql_shape, "expected outer and base VECTOR_SEARCH projections"
+
+    base_projection = sql_shape.group("base_projection")
+    assert not re.search(r"\bAS\b", base_projection, flags=re.IGNORECASE)
+    assert tuple(field.strip() for field in base_projection.split(",")) == (
+        "chunks.embedding",
+        "chunks.content",
+        "chunks.contextual_content",
+        "chunks.citation",
+        "chunks.relative_path",
+        "chunks.heading_path",
+        "chunks.symbol",
+        "chunks.start_line",
+        "chunks.end_line",
+        "chunks.chunk_id",
+        "chunks.source_id",
+        "chunks.corpus_id",
+    )
+    outer_projection = " ".join(sql_shape.group("outer_projection").split())
+    assert "base.relative_path AS source_path" in outer_projection
+    assert "base.source_path" not in outer_projection
+
+
 def test_search_document_chunks_uses_exact_prefiltered_parameterized_vector_search(monkeypatch):
     client = _FakeSearchClient()
     monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
@@ -318,7 +366,8 @@ def test_search_document_chunks_uses_exact_prefiltered_parameterized_vector_sear
     assert "VECTOR INDEX" not in normalized_sql.upper()
     assert "FROM `test-project.test_dataset.document_chunks` AS chunks" in normalized_sql
     assert "document_sources" not in normalized_sql
-    assert "chunks.relative_path AS source_path" in normalized_sql
+    assert "chunks.relative_path" in normalized_sql
+    assert "base.relative_path AS source_path" in normalized_sql
     assert "chunks.is_active = TRUE" in normalized_sql
     base_query_end = normalized_sql.index("), 'embedding'")
     for predicate in (
@@ -337,7 +386,7 @@ def test_search_document_chunks_uses_exact_prefiltered_parameterized_vector_sear
         "base.content",
         "base.contextual_content",
         "base.citation",
-        "base.source_path",
+        "base.relative_path AS source_path",
         "base.heading_path",
         "base.symbol",
         "base.start_line",
