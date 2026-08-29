@@ -38,3 +38,50 @@ CREATE TABLE IF NOT EXISTS `{{project}}.{{dataset}}.memory_revisions` (
   created_at TIMESTAMP NOT NULL,
   ttl_expires_at TIMESTAMP
 ) OPTIONS(description="Revision audit trail");
+
+-- document_sources: canonical source identity and revision lifecycle
+CREATE TABLE IF NOT EXISTS `{{project}}.{{dataset}}.document_sources` (
+  source_id STRING NOT NULL,
+  corpus_id STRING NOT NULL,
+  user_id STRING NOT NULL,
+  agent_name STRING NOT NULL,
+  source_kind STRING NOT NULL,
+  content_kind STRING NOT NULL,
+  relative_path STRING NOT NULL,
+  source_uri STRING NOT NULL,
+  revision STRING NOT NULL,
+  content_hash STRING NOT NULL,
+  metadata JSON,
+  is_active BOOL NOT NULL,
+  first_seen_at TIMESTAMP NOT NULL,
+  last_seen_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP NOT NULL
+)
+CLUSTER BY user_id, agent_name, corpus_id, source_kind;
+
+-- document_chunks: citation-bearing text and retrieval embeddings
+CREATE TABLE IF NOT EXISTS `{{project}}.{{dataset}}.document_chunks` (
+  chunk_id STRING NOT NULL,
+  source_id STRING NOT NULL,
+  corpus_id STRING NOT NULL,
+  user_id STRING NOT NULL,
+  agent_name STRING NOT NULL,
+  ordinal INT64 NOT NULL,
+  content STRING NOT NULL,
+  contextual_content STRING NOT NULL,
+  content_hash STRING NOT NULL,
+  heading_path ARRAY<STRING>,
+  symbol STRING,
+  start_line INT64,
+  end_line INT64,
+  citation STRING NOT NULL,
+  embedding ARRAY<FLOAT64> NOT NULL,
+  embedding_model STRING NOT NULL,
+  embedding_task_type STRING NOT NULL,
+  embedding_dimensions INT64 NOT NULL,
+  metadata JSON,
+  is_active BOOL NOT NULL,
+  created_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP NOT NULL
+)
+CLUSTER BY user_id, agent_name, corpus_id, source_id;

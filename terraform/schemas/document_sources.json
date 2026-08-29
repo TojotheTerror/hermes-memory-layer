@@ -1,0 +1,19 @@
+{
+  "fields": [
+    {"name": "source_id", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "corpus_id", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "user_id", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "agent_name", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "source_kind", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "content_kind", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "relative_path", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "source_uri", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "revision", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "content_hash", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "metadata", "type": "JSON", "mode": "NULLABLE"},
+    {"name": "is_active", "type": "BOOL", "mode": "REQUIRED"},
+    {"name": "first_seen_at", "type": "TIMESTAMP", "mode": "REQUIRED"},
+    {"name": "last_seen_at", "type": "TIMESTAMP", "mode": "REQUIRED"},
+    {"name": "updated_at", "type": "TIMESTAMP", "mode": "REQUIRED"}
+  ]
+}
