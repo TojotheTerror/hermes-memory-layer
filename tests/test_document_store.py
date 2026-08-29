@@ -80,9 +80,15 @@ def _json_fields(path: Path) -> list[tuple[str, str, str]]:
     return [(field["name"], field["type"], field["mode"]) for field in schema["fields"]]
 
 
-def _cluster_fields(ddl: str) -> list[str]:
-    match = re.search(r"CLUSTER BY ([^;]+);", ddl)
-    assert match
+def _cluster_fields(ddl: str, table_name: str | None = None) -> list[str]:
+    pattern = r"CLUSTER BY ([^;]+);"
+    if table_name:
+        pattern = (
+            rf"CREATE TABLE IF NOT EXISTS `[^`]+\.{table_name}` \(.*?\)\s*"
+            rf"CLUSTER BY ([^;]+);"
+        )
+    match = re.search(pattern, ddl, flags=re.DOTALL)
+    assert match, f"missing clustering contract for {table_name or 'DDL'}"
     return [field.strip() for field in match.group(1).split(",")]
 
 
@@ -114,9 +120,27 @@ def test_document_table_contracts_match_python_sql_and_terraform_json(
     assert _ddl_fields(sql_ddl, table_name) == expected_fields
     assert _json_fields(terraform_schema) == expected_fields
     assert _cluster_fields(python_ddl) == cluster_fields
+    assert _cluster_fields(sql_ddl, table_name) == cluster_fields
 
 
-def test_terraform_defines_document_tables_without_indexes():
+def test_terraform_pins_supported_cli_and_google_provider_series():
+    terraform = (ROOT / "terraform" / "main.tf").read_text()
+
+    assert 'required_version = ">= 1.6.0, < 2.0.0"' in terraform
+    assert 'version = "~> 6.0"' in terraform
+
+
+def test_terraform_commits_google_provider_lock():
+    lock_path = ROOT / "terraform" / ".terraform.lock.hcl"
+
+    assert lock_path.is_file(), "terraform provider lockfile must be committed"
+    lock = lock_path.read_text()
+    assert 'provider "registry.terraform.io/hashicorp/google"' in lock
+    assert 'version     = "6.' in lock
+    assert 'constraints = "~> 6.0"' in lock
+
+
+def test_terraform_defines_protected_document_tables_without_indexes():
     terraform = (ROOT / "terraform" / "main.tf").read_text()
     variables = (ROOT / "terraform" / "variables.tf").read_text()
     schema_sql = (ROOT / "bigquery" / "schema.sql").read_text()
@@ -134,7 +158,8 @@ def test_terraform_defines_document_tables_without_indexes():
         assert resource, f"missing Terraform resource for {table_name}"
         assert re.search(rf'table_id\s*=\s*"{table_name}"', resource.group(1))
         assert f'schemas/{table_name}.json' in resource.group(1)
-        assert "deletion_protection = false" in resource.group(1)
+        assert "deletion_protection = true" in resource.group(1)
+        assert re.search(r"lifecycle\s*\{\s*prevent_destroy\s*=\s*true\s*\}", resource.group(1))
         quoted_fields = ", ".join(f'"{field}"' for field in cluster_fields)
         assert f"clustering          = [{quoted_fields}]" in resource.group(1)
 
@@ -175,6 +200,38 @@ class _FakeBigQueryClient:
     def query(self, sql):
         self.queries.append(sql)
         return _FakeJob()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("project", "test-project` DROP TABLE victims; --"),
+        ("project", "test-project;DROP TABLE victims"),
+        ("project", "test-project` -- comment"),
+        ("project", "test project"),
+        ("project", "other-project.test_dataset"),
+        ("bq_dataset", "test_dataset` DROP TABLE victims; --"),
+        ("bq_dataset", "test_dataset;DROP TABLE victims"),
+        ("bq_dataset", "test_dataset/*comment*/"),
+        ("bq_dataset", "test dataset"),
+        ("bq_dataset", "other_project.test_dataset"),
+    ],
+)
+def test_ensure_tables_rejects_adversarial_ddl_identifiers_before_query(
+    monkeypatch, field, value
+):
+    client = _FakeBigQueryClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = (
+        HermesMemoryConfig(project=value, bq_dataset="test_dataset")
+        if field == "project"
+        else HermesMemoryConfig(project="test-project", bq_dataset=value)
+    )
+
+    with pytest.raises(ValueError, match=rf"Invalid BigQuery {field}"):
+        bigquery_store.ensure_tables(cfg)
+
+    assert client.queries == []
 
 
 def test_ensure_tables_executes_document_ddl_idempotently(monkeypatch):

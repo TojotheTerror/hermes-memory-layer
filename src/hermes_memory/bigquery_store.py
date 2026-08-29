@@ -1,9 +1,7 @@
 """BigQuery store — dataset, tables, views, inserts, vector search, analytics."""
 from __future__ import annotations
 
-import datetime
-import json
-from typing import Any
+import re
 
 from .config import HermesMemoryConfig, load_config
 
@@ -121,6 +119,17 @@ ORDER BY created_at DESC;
 """,
 }
 
+_PROJECT_ID_PATTERN = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", flags=re.ASCII)
+_DATASET_ID_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,1023}", flags=re.ASCII)
+
+
+def _validate_ddl_identifiers(cfg: HermesMemoryConfig) -> None:
+    """Reject unsafe or malformed identifiers before interpolating BigQuery DDL."""
+    if _PROJECT_ID_PATTERN.fullmatch(cfg.project) is None:
+        raise ValueError(f"Invalid BigQuery project: {cfg.project!r}")
+    if _DATASET_ID_PATTERN.fullmatch(cfg.bq_dataset) is None:
+        raise ValueError(f"Invalid BigQuery bq_dataset: {cfg.bq_dataset!r}")
+
 
 def _bq_client(cfg: HermesMemoryConfig):
     try:
@@ -151,6 +160,7 @@ def ensure_dataset(cfg: HermesMemoryConfig | None = None):
 
 def ensure_tables(cfg: HermesMemoryConfig | None = None):
     cfg = cfg or load_config()
+    _validate_ddl_identifiers(cfg)
     client = _bq_client(cfg)
     if client is None:
         print("[mock] ensure_tables skipped")
