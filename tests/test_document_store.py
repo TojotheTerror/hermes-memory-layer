@@ -521,6 +521,44 @@ def test_insert_chunks_rejects_embedding_contract_before_client_writes(monkeypat
     assert client.inserts == []
 
 
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+        pytest.param(True, id="boolean"),
+        pytest.param("private-vector-value", id="non-numeric"),
+    ],
+)
+@pytest.mark.parametrize("position", range(3), ids=("first", "middle", "last"))
+def test_insert_chunks_rejects_non_finite_or_non_numeric_embedding_values_before_client_writes(
+    monkeypatch, invalid_value, position
+):
+    embedding = [0.1, 0.2, 0.3]
+    embedding[position] = invalid_value
+    chunk = _chunk(embedding=embedding, text="private-source-content")
+    client = _StoreFakeClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    with pytest.raises(ValueError, match="embedding") as exc_info:
+        bigquery_store.insert_chunks(
+            [chunk],
+            user_id="user-1",
+            agent_name="hermes",
+            embedding_model="test-embedding-model",
+            embedding_dimensions=3,
+            cfg=cfg,
+        )
+
+    error = str(exc_info.value)
+    assert "private-source-content" not in error
+    assert "private-vector-value" not in error
+    assert client.queries == []
+    assert client.inserts == []
+
+
 def test_finalize_source_revision_atomically_activates_chunks_and_source_metadata(monkeypatch):
     old_source = _source(
         source_id="source'; --",

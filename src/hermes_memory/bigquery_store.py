@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 
 from .config import HermesMemoryConfig, load_config
@@ -319,6 +320,8 @@ def insert_chunks(
         embedding = chunk.get("embedding")
         if embedding is None or len(embedding) != embedding_dimensions:
             raise ValueError(f"chunk {chunk.get('chunk_id')!r} has wrong embedding vector length")
+        if any(type(value) not in (int, float) or not math.isfinite(value) for value in embedding):
+            raise ValueError("chunk embedding must contain only finite numeric values")
     client = _bq_client(cfg)
     if client is None:
         raise RuntimeError("BigQuery client unavailable")
