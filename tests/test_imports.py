@@ -71,3 +71,27 @@ def test_bridge_mock_is_fully_isolated(monkeypatch):
         ("bigquery", "test_user", 3, "test-project"),
         ("local", 3),
     ]
+
+
+def test_bridge_local_reader_failure_preserves_cloud_context(capsys):
+    from hermes_memory.config import HermesMemoryConfig
+    from hermes_memory.hermes_bridge import HermesBridge
+
+    def fail_local_reader(*, limit):
+        raise RuntimeError("sensitive local path")
+
+    bridge = HermesBridge(
+        HermesMemoryConfig(project="test-project", agent_engine_id="fake-engine"),
+        memory_bank_retriever=lambda *args, **kwargs: [{"fact": "memory-bank fact"}],
+        bigquery_retriever=lambda *args, **kwargs: [{"fact": "bigquery fact"}],
+        local_memory_reader=fail_local_reader,
+    )
+
+    ctx = bridge.retrieve_context(user_id="test_user", query="hello", top_k=3)
+
+    assert ctx["local_hits"] == []
+    assert [item["fact"] for item in ctx["merged"]] == [
+        "memory-bank fact",
+        "bigquery fact",
+    ]
+    assert capsys.readouterr().out == "[bridge] Local memory read failed\n"

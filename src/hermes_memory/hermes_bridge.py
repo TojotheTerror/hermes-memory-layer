@@ -211,7 +211,11 @@ class HermesBridge:
             print(f"[bridge] BigQuery retrieve failed: {e}")
 
         # Local SQLite as third source (always available)
-        local_hits = self._local_memory_reader(limit=top_k)
+        local_hits: list[dict] = []
+        try:
+            local_hits = self._local_memory_reader(limit=top_k)
+        except Exception:
+            print("[bridge] Local memory read failed")
 
         # Merge + dedupe by fact text (case-insensitive)
         seen: set[str] = set()

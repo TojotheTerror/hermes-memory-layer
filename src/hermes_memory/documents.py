@@ -1,15 +1,28 @@
 """Immutable document records and deterministic identity helpers."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import posixpath
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 
 
 SourceKind = Literal["obsidian", "git"]
 ContentKind = Literal["markdown", "code", "text"]
+
+
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, Set):
+        return frozenset(_deep_freeze(item) for item in value)
+    return copy.deepcopy(value)
 
 
 @dataclass(frozen=True)
@@ -26,6 +39,9 @@ class SourceDocument:
     content_hash: str
     text: str
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _deep_freeze(self.metadata))
 
 
 @dataclass(frozen=True)
@@ -55,6 +71,9 @@ class DocumentChunk:
     embedding: tuple[float, ...] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "metadata", _deep_freeze(self.metadata))
+
 
 def normalize_text(text: str) -> str:
     """Normalize platform line endings before content hashing."""
@@ -67,7 +86,12 @@ def sha256_text(text: str) -> str:
 
 
 def _sha256_parts(*parts: str) -> str:
-    return hashlib.sha256("".join(parts).encode("utf-8")).hexdigest()
+    digest = hashlib.sha256()
+    for part in parts:
+        encoded = part.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 
 def _normalize_path(value: str) -> str:

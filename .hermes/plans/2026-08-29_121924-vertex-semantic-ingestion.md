@@ -175,13 +175,16 @@ class DocumentChunk:
     metadata: dict[str, Any] = field(default_factory=dict)
 ```
 
-Identity rules:
+Identity rules use one unambiguous canonical framing for every multi-part hash. UTF-8 encode each
+part, prefix each encoded part with its fixed-width 8-byte unsigned big-endian byte length, concatenate
+the resulting frames without delimiters, then hash the bytes:
 
 ```text
-corpus_id = sha256(source_kind + canonical_root_or_remote)[:24]
-source_id = sha256(corpus_id + normalized_relative_path)[:32]
+frame(parts) = concat(uint64_be(len(utf8(part))) + utf8(part) for part in parts)
+corpus_id = sha256(frame([source_kind, canonical_root_or_remote]))[:24]
+source_id = sha256(frame([corpus_id, normalized_relative_path]))[:32]
 content_hash = sha256(normalized_source_or_chunk_text)
-chunk_id = sha256(source_id + heading_or_symbol + occurrence + chunk_content_hash)[:40]
+chunk_id = sha256(frame([source_id, heading_or_symbol, str(occurrence), chunk_content_hash]))[:40]
 ```
 
 `chunk_id` is content-addressed. A changed chunk receives a new ID; an unchanged chunk keeps its ID. After a successful source replacement, older IDs for that `source_id` are marked inactive in the same lifecycle step.
