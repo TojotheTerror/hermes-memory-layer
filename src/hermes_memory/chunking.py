@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import ast
-from math import ceil
+from math import ceil, isfinite, sqrt
 import re
+from typing import Any, Protocol, Sequence, cast
 
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
 
 from hermes_memory.documents import AtomicUnit
 
-__all__ = ["AtomicUnit", "pack_markdown_units", "parse_code_units", "parse_markdown_units"]
+__all__ = [
+    "AtomicUnit",
+    "pack_markdown_units",
+    "pack_semantic_markdown_units",
+    "parse_code_units",
+    "parse_markdown_units",
+]
 
 _MARKDOWN = MarkdownIt("commonmark")
 _UNIT_TOKEN_TYPES = {
@@ -24,6 +31,12 @@ _UNIT_TOKEN_TYPES = {
     "ordered_list_open",
     "paragraph_open",
 }
+
+
+class _SemanticGateway(Protocol):
+    task_type: str
+
+    def embed_many(self, texts: list[str]) -> Sequence[Any]: ...
 
 
 def _split_markdown_lines(text: str) -> list[str]:
@@ -334,6 +347,181 @@ def pack_markdown_units(
         for section in sections
         for chunk in _pack_section(section, target_tokens, max_tokens, overlap_tokens)
     ]
+
+
+def _is_finite_number(value: object) -> bool:
+    if type(value) not in (int, float):
+        return False
+    try:
+        return isfinite(cast(int | float, value))
+    except OverflowError:
+        return False
+
+
+def _cosine_similarity(left: tuple[float, ...], right: tuple[float, ...]) -> float:
+    if not left or len(left) != len(right):
+        raise ValueError("vectors must have the same positive dimension")
+    if not all(_is_finite_number(value) for value in (*left, *right)):
+        raise ValueError("vector values must be finite numbers")
+    left_squared = sum(value * value for value in left)
+    right_squared = sum(value * value for value in right)
+    dot_product = sum(a * b for a, b in zip(left, right, strict=True))
+    if not all(isfinite(value) for value in (left_squared, right_squared, dot_product)):
+        raise ValueError("vector calculation must remain finite")
+    left_norm = sqrt(left_squared)
+    right_norm = sqrt(right_squared)
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return dot_product / (left_norm * right_norm)
+
+
+def _validate_embedding_vectors(vectors: list[tuple[float, ...]], expected_count: int) -> None:
+    if len(vectors) != expected_count:
+        raise ValueError("gateway must return exactly one embedding per atomic unit")
+    if not vectors:
+        return
+    dimension = len(vectors[0])
+    for vector in vectors:
+        if len(vector) != dimension:
+            raise ValueError("embedding vectors must have exactly the same dimension")
+        _cosine_similarity(vector, vector)
+
+
+def _select_semantic_boundary(
+    units: list[AtomicUnit],
+    vectors: list[tuple[float, ...]],
+    *,
+    start: int,
+    min_tokens: int,
+    target_tokens: int,
+    max_tokens: int,
+) -> int | None:
+    _validate_embedding_vectors(vectors, len(units))
+    candidates: list[tuple[float, int, int, int]] = []
+    for end in range(start + 1, len(units)):
+        token_count = _token_estimate("".join(unit.text for unit in units[start:end]))
+        if token_count > max_tokens:
+            break
+        if token_count >= min_tokens:
+            candidates.append(
+                (
+                    _cosine_similarity(vectors[end - 1], vectors[end]),
+                    abs(token_count - target_tokens),
+                    units[end].start_line,
+                    end,
+                )
+            )
+    return min(candidates)[-1] if candidates else None
+
+
+def _semantic_section(
+    units: list[AtomicUnit],
+    vectors: list[tuple[float, ...]],
+    *,
+    min_tokens: int,
+    target_tokens: int,
+    max_tokens: int,
+    overlap_tokens: int,
+) -> list[AtomicUnit]:
+    groups: list[list[AtomicUnit]] = []
+    start = 0
+    while _token_estimate("".join(unit.text for unit in units[start:])) > max_tokens:
+        end = _select_semantic_boundary(
+            units,
+            vectors,
+            start=start,
+            min_tokens=min_tokens,
+            target_tokens=target_tokens,
+            max_tokens=max_tokens,
+        )
+        if end is None:
+            return _pack_section(units, target_tokens, max_tokens, overlap_tokens)
+        groups.append(units[start:end])
+        start = end
+    groups.append(units[start:])
+    packed: list[AtomicUnit] = []
+    for index, group in enumerate(groups):
+        overlap: list[AtomicUnit] = []
+        if index:
+            for unit in reversed(groups[index - 1]):
+                candidate_overlap = [unit, *overlap]
+                overlap_text = "".join(item.text for item in candidate_overlap)
+                chunk_text = overlap_text + "".join(item.text for item in group)
+                if (
+                    _token_estimate(overlap_text) > overlap_tokens
+                    or _token_estimate(chunk_text) > max_tokens
+                ):
+                    break
+                overlap = candidate_overlap
+        packed.append(_pack([*overlap, *group]))
+    return packed
+
+
+def pack_semantic_markdown_units(
+    units: list[AtomicUnit],
+    *,
+    gateway: _SemanticGateway | None,
+    min_tokens: int,
+    target_tokens: int,
+    max_tokens: int,
+    overlap_tokens: int = 0,
+    dry_run: bool = False,
+    strategy: str = "vertex-semantic",
+) -> list[AtomicUnit]:
+    """Refine oversized sections; dry-run and structural mode never call the gateway."""
+    _validate_packing_limits(target_tokens, max_tokens, overlap_tokens)
+    if type(min_tokens) is not int or not 0 < min_tokens <= target_tokens:
+        raise ValueError(
+            "packing limits must satisfy 0 < min_tokens <= target_tokens <= max_tokens"
+        )
+    if type(dry_run) is not bool:
+        raise ValueError("dry_run must be a boolean")
+    if type(strategy) is not str or strategy not in {"structural", "vertex-semantic"}:
+        raise ValueError("strategy must be 'structural' or 'vertex-semantic'")
+    if strategy == "structural" or dry_run:
+        return pack_markdown_units(
+            units,
+            target_tokens=target_tokens,
+            max_tokens=max_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+    sections: list[list[AtomicUnit]] = []
+    for unit in units:
+        if sections and (unit.heading_path, unit.symbol) == (
+            sections[-1][0].heading_path,
+            sections[-1][0].symbol,
+        ):
+            sections[-1].append(unit)
+        else:
+            sections.append([unit])
+
+    if all(
+        _token_estimate("".join(unit.text for unit in section)) <= max_tokens
+        for section in sections
+    ):
+        return [_pack(section) for section in sections]
+    if gateway is None or getattr(gateway, "task_type", None) != "SEMANTIC_SIMILARITY":
+        raise ValueError("semantic gateway must use task type SEMANTIC_SIMILARITY")
+
+    chunks: list[AtomicUnit] = []
+    for section in sections:
+        if _token_estimate("".join(unit.text for unit in section)) <= max_tokens:
+            chunks.append(_pack(section))
+            continue
+        results = gateway.embed_many([unit.text for unit in section])
+        vectors = [tuple(result.values) for result in results]
+        _validate_embedding_vectors(vectors, len(section))
+        chunks.extend(
+            _semantic_section(
+                section,
+                vectors,
+                min_tokens=min_tokens,
+                target_tokens=target_tokens,
+                max_tokens=max_tokens,
+                overlap_tokens=overlap_tokens,
+            )
+        )
+    return chunks
 
 
 def _heading_text(tokens: list[Token], index: int) -> str:
