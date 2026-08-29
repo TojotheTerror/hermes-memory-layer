@@ -188,6 +188,13 @@ def test_direct_document_numeric_settings_require_actual_integers(setting, inval
         HermesMemoryConfig(project="test-project", **{setting: invalid_value})
 
 
+@pytest.mark.parametrize("setting", DOCUMENT_NUMERIC_SETTINGS)
+@pytest.mark.parametrize("invalid_override", [True, 1.5, "1", b"1"])
+def test_document_numeric_overrides_require_actual_integers(setting, invalid_override):
+    with pytest.raises(TypeError, match=rf"{setting} must be an integer"):
+        load_config(project="test-project", **{setting: invalid_override})
+
+
 @pytest.mark.parametrize(
     "setting",
     [
