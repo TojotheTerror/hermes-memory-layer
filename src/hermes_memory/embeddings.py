@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import deque
+from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from hashlib import sha256
@@ -25,6 +27,13 @@ class EmbeddingResult:
     billable_character_count: int | None
     truncated: bool
     model: str
+
+
+@dataclass(frozen=True)
+class _EmbeddingConfig:
+    model: str
+    dimensions: int
+    task_type: str
 
 
 class VertexEmbeddingClient:
@@ -59,16 +68,31 @@ class VertexEmbeddingClient:
         ):
             raise ValueError("initial_retry_delay must be a finite non-negative number")
         self._client = client
-        self.model = model
-        self.dimensions = dimensions
-        self.task_type = task_type
+        self._config = _EmbeddingConfig(
+            model=model,
+            dimensions=dimensions,
+            task_type=task_type,
+        )
         self._concurrency = concurrency
         self._max_attempts = max_attempts
         self._initial_retry_delay = initial_retry_delay
         self._sleep = sleep
+        self._executor = ThreadPoolExecutor(max_workers=concurrency)
         self._cache: dict[tuple[str, int, str, str], EmbeddingResult] = {}
         self._inflight: dict[tuple[str, int, str, str], Future[EmbeddingResult]] = {}
         self._cache_lock = Lock()
+
+    @property
+    def model(self) -> str:
+        return self._config.model
+
+    @property
+    def dimensions(self) -> int:
+        return self._config.dimensions
+
+    @property
+    def task_type(self) -> str:
+        return self._config.task_type
 
     def embed(self, text: str) -> EmbeddingResult:
         cache_key = (self.model, self.dimensions, self.task_type, sha256(text.encode()).hexdigest())
@@ -138,10 +162,26 @@ class VertexEmbeddingClient:
             model=self.model,
         )
 
-    def embed_many(self, texts: list[str]) -> list[EmbeddingResult]:
+    def embed_many(self, texts: Iterable[str]) -> list[EmbeddingResult]:
         """Embed multiple inputs concurrently while preserving input order."""
-        with ThreadPoolExecutor(max_workers=self._concurrency) as executor:
-            return list(executor.map(self.embed, texts))
+        iterator = iter(texts)
+        pending: deque[Future[EmbeddingResult]] = deque()
+        for _ in range(self._concurrency):
+            try:
+                text = next(iterator)
+            except StopIteration:
+                break
+            pending.append(self._executor.submit(self.embed, text))
+
+        results: list[EmbeddingResult] = []
+        while pending:
+            results.append(pending.popleft().result())
+            try:
+                text = next(iterator)
+            except StopIteration:
+                continue
+            pending.append(self._executor.submit(self.embed, text))
+        return results
 
     def _request(self, text: str) -> Any:
         for attempt in range(self._max_attempts):

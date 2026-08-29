@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
+from hashlib import sha256
 from threading import Event, Lock
 from types import SimpleNamespace
 
@@ -103,6 +104,35 @@ class DuplicateBlockingModels:
                 self.second_started.set()
         assert self.release.wait(timeout=1)
         return embedding_response([0.1])
+
+
+class ConfigBlockingModels:
+    def __init__(self):
+        self.started = Event()
+        self.release = Event()
+        self.calls = []
+
+    def embed_content(self, **kwargs):
+        self.calls.append(kwargs)
+        self.started.set()
+        assert self.release.wait(timeout=1)
+        return embedding_response([0.1])
+
+
+class SubmissionTrackingIterable:
+    def __init__(self, total, release, allowed_before_release):
+        self.total = total
+        self.release = release
+        self.allowed_before_release = allowed_before_release
+        self.yielded = 0
+        self.eager_submission = Event()
+
+    def __iter__(self):
+        for value in range(self.total):
+            self.yielded += 1
+            if self.yielded > self.allowed_before_release and not self.release.is_set():
+                self.eager_submission.set()
+            yield str(value)
 
 
 def embedding_response(values, *, token_count=None, truncated=None, billable_count=None):
@@ -367,14 +397,11 @@ def test_embed_caches_by_config_and_text_digest():
     assert len(client.models.calls) == 1
 
 
-def test_cache_key_is_exactly_model_dimensions_task_and_text_sha256():
+def test_cache_key_contains_immutable_config_and_text_sha256():
     client = sequenced_client(
         [
             embedding_response([1.0]),
             embedding_response([2.0]),
-            embedding_response([3.0, 3.0]),
-            embedding_response([4.0]),
-            embedding_response([5.0]),
         ]
     )
     gateway = VertexEmbeddingClient(
@@ -385,27 +412,52 @@ def test_cache_key_is_exactly_model_dimensions_task_and_text_sha256():
     )
 
     original = gateway.embed("same")
-    gateway.model = "model-b"
-    changed_model = gateway.embed("same")
-    gateway.model = "model-a"
-    gateway.dimensions = 2
-    changed_dimensions = gateway.embed("same")
-    gateway.dimensions = 1
-    gateway.task_type = "TASK_B"
-    changed_task = gateway.embed("same")
-    gateway.task_type = "TASK_A"
     changed_text = gateway.embed("different")
     cached_original = gateway.embed("same")
 
-    assert [
-        original.values,
-        changed_model.values,
-        changed_dimensions.values,
-        changed_task.values,
-        changed_text.values,
-        cached_original.values,
-    ] == [(1.0,), (2.0,), (3.0, 3.0), (4.0,), (5.0,), (1.0,)]
-    assert len(client.models.calls) == 5
+    assert [original.values, changed_text.values, cached_original.values] == [
+        (1.0,),
+        (2.0,),
+        (1.0,),
+    ]
+    assert set(gateway._cache) == {
+        ("model-a", 1, "TASK_A", sha256(text.encode()).hexdigest())
+        for text in ("same", "different")
+    }
+    assert len(client.models.calls) == 2
+
+
+def test_configuration_cannot_change_while_a_request_is_in_flight():
+    models = ConfigBlockingModels()
+    gateway = VertexEmbeddingClient(
+        client=SimpleNamespace(models=models),
+        model="model-a",
+        dimensions=1,
+        task_type="TASK_A",
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        future = caller.submit(gateway.embed, "blocked")
+        assert models.started.wait(timeout=1)
+        try:
+            with pytest.raises(AttributeError):
+                gateway.model = "model-b"
+            with pytest.raises(AttributeError):
+                gateway.dimensions = 2
+            with pytest.raises(AttributeError):
+                gateway.task_type = "TASK_B"
+        finally:
+            models.release.set()
+        result = future.result(timeout=1)
+
+    cached = gateway.embed("blocked")
+    call = models.calls[0]
+    assert call["model"] == "model-a"
+    assert call["config"].output_dimensionality == 1
+    assert call["config"].task_type == "TASK_A"
+    assert result.model == "model-a"
+    assert cached == result
+    assert len(models.calls) == 1
 
 
 def test_embed_many_preserves_input_order_when_requests_complete_out_of_order():
@@ -441,6 +493,55 @@ def test_embed_many_never_exceeds_configured_concurrency():
 
     assert models.max_active == 2
     assert [result.values for result in results] == [(1.0,), (2.0,), (3.0,), (4.0,)]
+
+
+def test_concurrent_embed_many_calls_share_the_instance_concurrency_bound():
+    models = BlockingModels()
+    gateway = VertexEmbeddingClient(
+        client=SimpleNamespace(models=models),
+        dimensions=1,
+        concurrency=2,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as callers:
+        first = callers.submit(gateway.embed_many, ["1", "2"])
+        second = callers.submit(gateway.embed_many, ["3", "4"])
+        assert models.two_started.wait(timeout=1)
+        try:
+            assert not models.four_started.wait(timeout=0.1)
+        finally:
+            models.release.set()
+        results = first.result(timeout=1) + second.result(timeout=1)
+
+    assert models.max_active == 2
+    assert sorted(result.values for result in results) == [(1.0,), (2.0,), (3.0,), (4.0,)]
+
+
+def test_embed_many_keeps_a_bounded_submission_window_for_large_iterables():
+    models = BlockingModels()
+    gateway = VertexEmbeddingClient(
+        client=SimpleNamespace(models=models),
+        dimensions=1,
+        concurrency=2,
+    )
+    texts = SubmissionTrackingIterable(
+        total=250,
+        release=models.release,
+        allowed_before_release=2,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        future = caller.submit(gateway.embed_many, texts)
+        assert models.two_started.wait(timeout=1)
+        try:
+            assert not texts.eager_submission.wait(timeout=0.1)
+            assert texts.yielded == 2
+        finally:
+            models.release.set()
+        results = future.result(timeout=2)
+
+    assert len(results) == 250
+    assert [result.values for result in results] == [(float(value),) for value in range(250)]
 
 
 def test_concurrent_cache_misses_for_same_key_share_one_request():
