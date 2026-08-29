@@ -24,6 +24,32 @@ _UNIT_TOKEN_TYPES = {
 }
 
 
+def _split_markdown_lines(text: str) -> list[str]:
+    """Split on CommonMark line endings while retaining their exact spelling."""
+    lines: list[str] = []
+    start = 0
+    index = 0
+
+    while index < len(text):
+        if text[index] == "\n":
+            index += 1
+        elif text[index] == "\r":
+            index += 1
+            if index < len(text) and text[index] == "\n":
+                index += 1
+        else:
+            index += 1
+            continue
+
+        lines.append(text[start:index])
+        start = index
+
+    if start < len(text):
+        lines.append(text[start:])
+
+    return lines
+
+
 def _frontmatter_end(lines: list[str]) -> int:
     """Return the exclusive end line for leading YAML frontmatter, or zero."""
     if not lines or lines[0].rstrip("\r\n") != "---":
@@ -55,7 +81,7 @@ def _heading_text(tokens: list[Token], index: int) -> str:
 
 def parse_markdown_units(text: str) -> list[AtomicUnit]:
     """Return source-preserving Markdown blocks with one-based inclusive line ranges."""
-    lines = text.splitlines(keepends=True)
+    lines = _split_markdown_lines(text)
     frontmatter_end = _frontmatter_end(lines)
     units: list[AtomicUnit] = []
 
