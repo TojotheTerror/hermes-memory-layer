@@ -120,7 +120,7 @@ ORDER BY created_at DESC;
 }
 
 _PROJECT_ID_PATTERN = re.compile(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", flags=re.ASCII)
-_DATASET_ID_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,1023}", flags=re.ASCII)
+_DATASET_ID_PATTERN = re.compile(r"[A-Za-z0-9_]{1,1024}", flags=re.ASCII)
 
 
 def _validate_ddl_identifiers(cfg: HermesMemoryConfig) -> None:
