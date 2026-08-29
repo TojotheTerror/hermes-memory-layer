@@ -16,7 +16,6 @@
     {"name": "citation", "type": "STRING", "mode": "REQUIRED"},
     {"name": "embedding", "type": "FLOAT64", "mode": "REPEATED"},
     {"name": "embedding_model", "type": "STRING", "mode": "REQUIRED"},
-    {"name": "embedding_task_type", "type": "STRING", "mode": "REQUIRED"},
     {"name": "embedding_dimensions", "type": "INT64", "mode": "REQUIRED"},
     {"name": "metadata", "type": "JSON", "mode": "NULLABLE"},
     {"name": "is_active", "type": "BOOL", "mode": "REQUIRED"},
