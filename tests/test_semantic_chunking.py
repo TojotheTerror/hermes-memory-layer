@@ -7,6 +7,7 @@ from hermes_memory.chunking import (
     _cosine_similarity,
     _select_semantic_boundary,
     pack_semantic_markdown_units,
+    parse_markdown_units,
 )
 
 
@@ -221,6 +222,22 @@ def test_cosine_similarity_rejects_finite_values_that_overflow_calculation():
 
 
 @pytest.mark.parametrize(
+    "huge_on_left",
+    [True, False],
+    ids=["left", "right"],
+)
+def test_cosine_similarity_rejects_huge_finite_integer_in_either_vector(huge_on_left):
+    huge = 10**200
+    left, right = ((huge,), (1,)) if huge_on_left else ((1,), (huge,))
+
+    with pytest.raises(ValueError) as error:
+        _cosine_similarity(left, right)
+
+    assert type(error.value) is ValueError
+    assert str(huge) not in str(error.value)
+
+
+@pytest.mark.parametrize(
     ("left", "right"),
     [
         ((), ()),
@@ -275,6 +292,24 @@ def test_one_unit_section_under_maximum_stays_whole_without_embedding():
     )
 
     assert packed == [AtomicUnit("small", ("Alpha",), None, 7, 7, 2)]
+
+
+def test_repeated_identical_markdown_headings_remain_distinct_physical_sections():
+    source = "# Repeat\nfirst section\n# Repeat\nsecond section\n"
+    units = parse_markdown_units(source)
+    gateway = FakeGateway([(1.0, 0.0), (0.0, 1.0)])
+
+    packed = pack_semantic_markdown_units(
+        units,
+        gateway=gateway,
+        min_tokens=2,
+        target_tokens=3,
+        max_tokens=4,
+    )
+
+    assert [chunk.text for chunk in packed] == ["first section\n", "second section\n"]
+    assert [(chunk.start_line, chunk.end_line) for chunk in packed] == [(2, 2), (4, 4)]
+    assert gateway.calls == []
 
 
 @pytest.mark.parametrize("line_ending", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])

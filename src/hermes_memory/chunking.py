@@ -76,7 +76,14 @@ def _frontmatter_end(lines: list[str]) -> int:
     return 0
 
 
-def _unit(lines: list[str], start: int, end: int, heading_path: tuple[str, ...]) -> AtomicUnit:
+def _unit(
+    lines: list[str],
+    start: int,
+    end: int,
+    heading_path: tuple[str, ...],
+    *,
+    section_start_line: int | None = None,
+) -> AtomicUnit:
     source = "".join(lines[start:end])
     return AtomicUnit(
         text=source,
@@ -85,6 +92,7 @@ def _unit(lines: list[str], start: int, end: int, heading_path: tuple[str, ...])
         start_line=start + 1,
         end_line=end,
         token_estimate=_token_estimate(source),
+        section_start_line=section_start_line,
     )
 
 
@@ -218,6 +226,7 @@ def _pack(units: list[AtomicUnit]) -> AtomicUnit:
         start_line=first.start_line,
         end_line=units[-1].end_line,
         token_estimate=_token_estimate(text),
+        section_start_line=first.section_start_line,
     )
 
 
@@ -258,6 +267,7 @@ def _hard_split(unit: AtomicUnit, max_tokens: int) -> list[AtomicUnit]:
                 start_line=start_line,
                 end_line=end_line,
                 token_estimate=_token_estimate(text),
+                section_start_line=unit.section_start_line,
             )
         )
     return pieces
@@ -321,6 +331,24 @@ def _validate_packing_limits(target_tokens: int, max_tokens: int, overlap_tokens
         )
 
 
+def _physical_sections(units: list[AtomicUnit]) -> list[list[AtomicUnit]]:
+    sections: list[list[AtomicUnit]] = []
+    for unit in units:
+        identity = (unit.heading_path, unit.symbol, unit.section_start_line)
+        if sections:
+            previous = sections[-1][0]
+            previous_identity = (
+                previous.heading_path,
+                previous.symbol,
+                previous.section_start_line,
+            )
+            if identity == previous_identity:
+                sections[-1].append(unit)
+                continue
+        sections.append([unit])
+    return sections
+
+
 def pack_markdown_units(
     units: list[AtomicUnit],
     *,
@@ -333,15 +361,7 @@ def pack_markdown_units(
     if not units:
         return []
 
-    sections: list[list[AtomicUnit]] = []
-    for unit in units:
-        if sections and (unit.heading_path, unit.symbol) == (
-            sections[-1][0].heading_path,
-            sections[-1][0].symbol,
-        ):
-            sections[-1].append(unit)
-        else:
-            sections.append([unit])
+    sections = _physical_sections(units)
     return [
         chunk
         for section in sections
@@ -363,16 +383,24 @@ def _cosine_similarity(left: tuple[float, ...], right: tuple[float, ...]) -> flo
         raise ValueError("vectors must have the same positive dimension")
     if not all(_is_finite_number(value) for value in (*left, *right)):
         raise ValueError("vector values must be finite numbers")
-    left_squared = sum(value * value for value in left)
-    right_squared = sum(value * value for value in right)
-    dot_product = sum(a * b for a, b in zip(left, right, strict=True))
-    if not all(isfinite(value) for value in (left_squared, right_squared, dot_product)):
+    try:
+        numeric_left = tuple(float(value) for value in left)
+        numeric_right = tuple(float(value) for value in right)
+        left_squared = sum(value * value for value in numeric_left)
+        right_squared = sum(value * value for value in numeric_right)
+        dot_product = sum(a * b for a, b in zip(numeric_left, numeric_right, strict=True))
+        if not all(isfinite(value) for value in (left_squared, right_squared, dot_product)):
+            raise ValueError("vector calculation must remain finite")
+        left_norm = sqrt(left_squared)
+        right_norm = sqrt(right_squared)
+        if left_norm == 0 or right_norm == 0:
+            return 0.0
+        similarity = dot_product / (left_norm * right_norm)
+    except ArithmeticError:
+        raise ValueError("vector calculation must remain finite") from None
+    if not isfinite(similarity):
         raise ValueError("vector calculation must remain finite")
-    left_norm = sqrt(left_squared)
-    right_norm = sqrt(right_squared)
-    if left_norm == 0 or right_norm == 0:
-        return 0.0
-    return dot_product / (left_norm * right_norm)
+    return similarity
 
 
 def _validate_embedding_vectors(vectors: list[tuple[float, ...]], expected_count: int) -> None:
@@ -485,15 +513,7 @@ def pack_semantic_markdown_units(
             max_tokens=max_tokens,
             overlap_tokens=overlap_tokens,
         )
-    sections: list[list[AtomicUnit]] = []
-    for unit in units:
-        if sections and (unit.heading_path, unit.symbol) == (
-            sections[-1][0].heading_path,
-            sections[-1][0].symbol,
-        ):
-            sections[-1].append(unit)
-        else:
-            sections.append([unit])
+    sections = _physical_sections(units)
 
     if all(
         _token_estimate("".join(unit.text for unit in section)) <= max_tokens
@@ -541,6 +561,7 @@ def parse_markdown_units(text: str) -> list[AtomicUnit]:
 
     tokens = _MARKDOWN.parse("".join(lines[frontmatter_end:]))
     headings: dict[int, str] = {}
+    section_start_line: int | None = None
     covered_until = 0
 
     for index, token in enumerate(tokens):
@@ -559,6 +580,7 @@ def parse_markdown_units(text: str) -> list[AtomicUnit]:
                 if heading_level < level
             }
             headings[level] = _heading_text(tokens, index)
+            section_start_line = frontmatter_end + start + 1
             covered_until = end
             continue
 
@@ -568,7 +590,15 @@ def parse_markdown_units(text: str) -> list[AtomicUnit]:
         heading_path = tuple(headings[level] for level in sorted(headings))
         absolute_start = frontmatter_end + start
         absolute_end = frontmatter_end + end
-        units.append(_unit(lines, absolute_start, absolute_end, heading_path))
+        units.append(
+            _unit(
+                lines,
+                absolute_start,
+                absolute_end,
+                heading_path,
+                section_start_line=section_start_line,
+            )
+        )
         covered_until = end
 
     return units

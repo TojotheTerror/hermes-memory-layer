@@ -79,6 +79,7 @@ class AtomicUnit:
     start_line: int
     end_line: int
     token_estimate: int
+    section_start_line: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "heading_path", tuple(self.heading_path))
