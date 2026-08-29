@@ -238,6 +238,92 @@ def test_dirty_override_uses_truthful_local_citation_and_revision_marker(
     assert source.metadata["remote_url"] == "https://github.com/owner/repo"
 
 
+def test_dirty_source_rejects_final_component_outside_symlink_swap_after_last_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repository"
+    _init_repo(repo)
+    source_path = repo / "README.md"
+    source_path.write_text("approved dirty bytes\n", encoding="utf-8")
+    outside = tmp_path / "outside-secret.md"
+    outside.write_text("outside body must not escape\n", encoding="utf-8")
+    real_discover_sources = source_discovery.discover_sources
+    real_is_symlink = Path.is_symlink
+    discovery_complete = False
+    swap_happened = False
+
+    def mark_discovery_complete(*args: Any, **kwargs: Any) -> source_discovery.DiscoveryResult:
+        nonlocal discovery_complete
+        result = real_discover_sources(*args, **kwargs)
+        discovery_complete = True
+        return result
+
+    def swap_after_last_check(path: Path) -> bool:
+        nonlocal swap_happened
+        was_symlink = real_is_symlink(path)
+        if path == source_path and discovery_complete and not swap_happened:
+            source_path.unlink()
+            source_path.symlink_to(outside)
+            swap_happened = True
+        return was_symlink
+
+    monkeypatch.setattr(source_discovery, "discover_sources", mark_discovery_complete)
+    monkeypatch.setattr(Path, "is_symlink", swap_after_last_check)
+
+    result = discover_repository(
+        repo,
+        SourcePolicy(include_patterns=("README.md",)),
+        for_apply=True,
+        allow_dirty=True,
+    )
+
+    assert swap_happened
+    assert result.sources == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("README.md", "detection_error"),
+    ]
+    assert "outside body" not in repr(result)
+    assert outside.as_uri() not in repr(result)
+
+
+def test_dirty_source_rejects_mutation_between_stable_read_and_uri_derivation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repository"
+    _init_repo(repo)
+    source_path = repo / "README.md"
+    stable_text = "stable dirty bytes\n"
+    changed_text = "URI now identifies different bytes\n"
+    source_path.write_text(stable_text, encoding="utf-8")
+    real_read = source_discovery._read_dirty_source_bytes
+    mutation_happened = False
+
+    def mutate_after_stable_read(path: Path) -> Any:
+        nonlocal mutation_happened
+        content = real_read(path)
+        path.write_text(changed_text, encoding="utf-8")
+        mutation_happened = True
+        return content
+
+    monkeypatch.setattr(source_discovery, "_read_dirty_source_bytes", mutate_after_stable_read)
+
+    result = discover_repository(
+        repo,
+        SourcePolicy(include_patterns=("README.md",)),
+        for_apply=True,
+        allow_dirty=True,
+    )
+
+    assert mutation_happened
+    assert source_path.read_text(encoding="utf-8") == changed_text
+    assert result.sources == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("README.md", "detection_error"),
+    ]
+    assert stable_text.strip() not in repr(result)
+    assert changed_text.strip() not in repr(result)
+
+
 @pytest.mark.parametrize(
     "remote",
     (

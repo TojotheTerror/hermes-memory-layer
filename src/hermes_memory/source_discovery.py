@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
+import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import subprocess
 from typing import Iterable, Literal
 from urllib.parse import quote, unquote, urlsplit
@@ -195,6 +197,12 @@ class _RepositorySymlinkError(RepositoryDiscoveryError):
     """Raised internally when the committed tree entry is a symlink."""
 
 
+@dataclass(frozen=True)
+class _DirtySourceRead:
+    content: bytes
+    stat_signature: tuple[int, int, int, int, int, int]
+
+
 def _run_git(root: Path, arguments: list[str], *, ok_returncodes: tuple[int, ...] = (0,)) -> str:
     try:
         completed = subprocess.run(
@@ -279,6 +287,53 @@ def _read_commit_blob(root: Path, revision: str, relative_path: str) -> bytes:
     if blob.returncode != 0 or not isinstance(blob.stdout, bytes):
         raise RepositoryDiscoveryError("unable to inspect repository")
     return blob.stdout
+
+
+def _dirty_stat_signature(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _read_dirty_source_bytes(path: Path) -> _DirtySourceRead:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise OSError("safe local source reads are unavailable")
+    descriptor = os.open(path, os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0))
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError("local source is not a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            content = source.read()
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    signature = _dirty_stat_signature(after)
+    if _dirty_stat_signature(before) != signature or len(content) != after.st_size:
+        raise OSError("local source changed while being read")
+    return _DirtySourceRead(content=content, stat_signature=signature)
+
+
+def _dirty_source_uri(root: Path, path: Path, source: _DirtySourceRead) -> str:
+    resolved_path = path.resolve(strict=True)
+    if not resolved_path.is_relative_to(root):
+        raise OSError("local source escaped repository")
+    current = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(current.st_mode) or _dirty_stat_signature(current) != source.stat_signature:
+        raise OSError("local source changed after being read")
+    source_uri = resolved_path.as_uri()
+    if path.resolve(strict=True) != resolved_path:
+        raise OSError("local source path changed")
+    current = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(current.st_mode) or _dirty_stat_signature(current) != source.stat_signature:
+        raise OSError("local source changed after citation derivation")
+    return source_uri
 
 
 def _matches(path: str, patterns: Iterable[str]) -> bool:
@@ -702,8 +757,25 @@ def discover_repository(
                     rejected.append(RejectedSource(relative_path, content_rule))
                     continue
                 text = content.decode("utf-8")
+                source_uri = f"{remote}/blob/{revision}/{quote(relative_path, safe='/')}"
+            elif dirty:
+                dirty_source = _read_dirty_source_bytes(path)
+                content = dirty_source.content
+                if len(content) > active_policy.max_file_size_bytes:
+                    rejected.append(RejectedSource(relative_path, "max_file_size"))
+                    continue
+                if _looks_binary(content):
+                    rejected.append(RejectedSource(relative_path, "binary_content"))
+                    continue
+                content_rule = _secret_content_rule(content) or _generated_content_rule(content)
+                if content_rule:
+                    rejected.append(RejectedSource(relative_path, content_rule))
+                    continue
+                text = content.decode("utf-8")
+                source_uri = _dirty_source_uri(root_path, path, dirty_source)
             else:
                 text = path.read_text(encoding="utf-8")
+                source_uri = path.resolve().as_uri()
         except _RepositorySymlinkError:
             rejected.append(RejectedSource(relative_path, "repository_symlink"))
             continue
@@ -711,9 +783,6 @@ def discover_repository(
             rejected.append(RejectedSource(relative_path, "detection_error"))
             continue
         content_kind, language = _content_kind_and_language(path)
-        source_uri = path.resolve().as_uri()
-        if remote is not None and not dirty:
-            source_uri = f"{remote}/blob/{revision}/{quote(relative_path, safe='/')}"
         documents.append(
             SourceDocument(
                 source_id=make_source_id(corpus_id, relative_path),
