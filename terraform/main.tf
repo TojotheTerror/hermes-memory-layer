@@ -1,6 +1,11 @@
 terraform {
+  required_version = ">= 1.6.0, < 2.0.0"
+
   required_providers {
-    google = { source = "hashicorp/google", version = ">= 5.0" }
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 6.0"
+    }
   }
 }
 
@@ -43,7 +48,11 @@ resource "google_bigquery_table" "document_sources" {
   description         = "Canonical document source identity and revision lifecycle"
   schema              = jsonencode(jsondecode(file("${path.module}/schemas/document_sources.json")).fields)
   clustering          = ["user_id", "agent_name", "corpus_id", "source_kind"]
-  deletion_protection = false
+  deletion_protection = true
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "google_bigquery_table" "document_chunks" {
@@ -52,5 +61,9 @@ resource "google_bigquery_table" "document_chunks" {
   description         = "Citation-bearing document chunks and retrieval embeddings"
   schema              = jsonencode(jsondecode(file("${path.module}/schemas/document_chunks.json")).fields)
   clustering          = ["user_id", "agent_name", "corpus_id", "source_id"]
-  deletion_protection = false
+  deletion_protection = true
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
