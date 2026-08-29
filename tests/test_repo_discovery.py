@@ -1,10 +1,12 @@
 from pathlib import Path
+import re
 import subprocess
 from typing import Any, cast
 
 import pytest
 
 import hermes_memory.source_discovery as source_discovery
+from hermes_memory.documents import make_corpus_id, make_source_id
 from hermes_memory.source_discovery import (
     RepositoryDirtyError,
     RepositoryDiscoveryError,
@@ -133,6 +135,83 @@ def test_clean_github_sources_have_commit_pinned_quoted_citations_and_metadata(
         "remote_url": "https://github.com/owner/repo",
         "relative_path": relative_path,
     }
+
+
+def test_clean_github_citation_reads_bytes_from_the_resolved_commit_after_status_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repository"
+    commit = _init_repo(repo)
+    _git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+    committed_text = "# Synthetic repository\n"
+    raced_text = "changed immediately after clean status\n"
+    real_run = subprocess.run
+    mutation_happened = False
+
+    def mutate_after_clean_status(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+        nonlocal mutation_happened
+        completed = real_run(*args, **kwargs)
+        command = cast(list[str], args[0])
+        if "status" in command and completed.returncode == 0 and completed.stdout == "":
+            (repo / "README.md").write_text(raced_text, encoding="utf-8")
+            mutation_happened = True
+        return completed
+
+    monkeypatch.setattr(source_discovery.subprocess, "run", mutate_after_clean_status)
+
+    result = discover_repository(
+        repo,
+        SourcePolicy(include_patterns=("README.md",)),
+    )
+
+    assert mutation_happened
+    assert result.state.dirty is False
+    source = result.sources[0]
+    assert source.source_uri == f"https://github.com/owner/repo/blob/{commit}/README.md"
+    assert source.text == committed_text
+    assert source.content_hash == source_discovery.sha256_text(committed_text)
+    assert (repo / "README.md").read_text(encoding="utf-8") == raced_text
+
+
+def test_clean_github_policy_checks_committed_bytes_after_status_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repository"
+    _init_repo(repo)
+    relative_path = "notes.md"
+    source_path = repo / relative_path
+    source_path.write_text("API_KEY=abcdefghijklmnop\n", encoding="utf-8")
+    _git(repo, "add", relative_path)
+    _git(
+        repo,
+        "-c",
+        "user.name=Test User",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "add policy fixture",
+    )
+    _git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+    real_run = subprocess.run
+
+    def hide_secret_after_clean_status(
+        *args: Any, **kwargs: Any
+    ) -> subprocess.CompletedProcess[Any]:
+        completed = real_run(*args, **kwargs)
+        command = cast(list[str], args[0])
+        if "status" in command and completed.returncode == 0 and completed.stdout == "":
+            source_path.write_text("apparently harmless\n", encoding="utf-8")
+        return completed
+
+    monkeypatch.setattr(source_discovery.subprocess, "run", hide_secret_after_clean_status)
+
+    result = discover_repository(repo, SourcePolicy(include_patterns=(relative_path,)))
+
+    assert result.sources == ()
+    assert (relative_path, "token_assignment") in [
+        (item.path, item.rule) for item in result.rejected
+    ]
 
 
 def test_dirty_override_uses_truthful_local_citation_and_revision_marker(
@@ -267,6 +346,52 @@ def test_git_commands_use_argument_lists_for_quoted_paths_and_refs(
     assert any(quoted_ref in command[-1] for command, _ in calls)
 
 
+def test_commit_blob_plumbing_separates_revision_from_option_like_unicode_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repository with spaces"
+    _init_repo(repo)
+    relative_path = "--help # café.md"
+    (repo / relative_path).write_text("committed bytes\n", encoding="utf-8")
+    _git(repo, "add", "--", relative_path)
+    _git(
+        repo,
+        "-c",
+        "user.name=Test User",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "add option-like path",
+    )
+    commit = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+    real_run = subprocess.run
+    calls: list[tuple[list[str], object]] = []
+
+    def recording_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+        calls.append((cast(list[str], args[0]), kwargs.get("shell")))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(source_discovery.subprocess, "run", recording_run)
+
+    source = discover_repository(
+        repo,
+        SourcePolicy(include_patterns=(relative_path,)),
+    ).sources[0]
+
+    ls_tree_calls = [command for command, _ in calls if "ls-tree" in command]
+    cat_file_calls = [command for command, _ in calls if "cat-file" in command]
+    assert source.text == "committed bytes\n"
+    assert len(ls_tree_calls) == 1
+    assert ls_tree_calls[0][-2:] == ["--", relative_path]
+    assert commit in ls_tree_calls[0]
+    assert all(f"{commit}:{relative_path}" not in argument for argument in ls_tree_calls[0])
+    assert len(cat_file_calls) == 1
+    assert re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", cat_file_calls[0][-1])
+    assert all(shell is not True for _, shell in calls)
+
+
 def test_repository_symlink_is_rejected_instead_of_citing_alias_content(tmp_path: Path) -> None:
     repo = tmp_path / "repository"
     _init_repo(repo)
@@ -285,6 +410,48 @@ def test_repository_symlink_is_rejected_instead_of_citing_alias_content(tmp_path
         "path": "alias.md",
         "rule": "repository_symlink",
     }
+
+
+def test_committed_symlink_cannot_be_raced_into_commit_pinned_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repository"
+    _init_repo(repo)
+    alias = repo / "alias.md"
+    alias.symlink_to("README.md")
+    _git(repo, "add", "alias.md")
+    _git(
+        repo,
+        "-c",
+        "user.name=Test User",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "add symlink",
+    )
+    _git(repo, "remote", "add", "origin", "https://github.com/owner/repo.git")
+    real_run = subprocess.run
+
+    def replace_symlink_after_clean_status(
+        *args: Any, **kwargs: Any
+    ) -> subprocess.CompletedProcess[Any]:
+        completed = real_run(*args, **kwargs)
+        command = cast(list[str], args[0])
+        if "status" in command and completed.returncode == 0 and completed.stdout == "":
+            alias.unlink()
+            alias.write_text("not a symlink anymore\n", encoding="utf-8")
+        return completed
+
+    monkeypatch.setattr(source_discovery.subprocess, "run", replace_symlink_after_clean_status)
+
+    result = discover_repository(repo, SourcePolicy(include_patterns=("alias.md",)))
+
+    assert result.sources == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("README.md", "not_in_allowlist"),
+        ("alias.md", "repository_symlink"),
+    ]
 
 
 def test_ref_that_does_not_match_checkout_is_rejected_before_citation(tmp_path: Path) -> None:
@@ -346,6 +513,46 @@ def test_repository_discovery_keeps_source_policy_order_and_safe_rejections(
         ("ignored.py", "git_ignored"),
     ]
     assert all(set(vars(item)) == {"path", "rule"} for item in result.rejected)
+
+
+def test_repository_documents_keep_canonical_ids_paths_and_immutable_metadata(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repository"
+    _init_repo(repo)
+    paths = ("a/bc.md", "ab/c.md")
+    for relative_path in paths:
+        path = repo / relative_path
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(f"# {relative_path}\n", encoding="utf-8")
+    _git(repo, "add", *paths)
+    _git(
+        repo,
+        "-c",
+        "user.name=Test User",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "add collision fixtures",
+    )
+    remote = "https://github.com/owner/repo"
+    _git(repo, "remote", "add", "origin", f"{remote}.git")
+
+    result = discover_repository(repo, SourcePolicy(include_patterns=paths))
+
+    corpus_id = make_corpus_id("git", remote)
+    sources = {source.relative_path: source for source in result.sources}
+    assert set(sources) == set(paths)
+    assert {source.corpus_id for source in sources.values()} == {corpus_id}
+    assert {relative_path: source.source_id for relative_path, source in sources.items()} == {
+        relative_path: make_source_id(corpus_id, relative_path) for relative_path in paths
+    }
+    assert sources["a/bc.md"].source_id != sources["ab/c.md"].source_id
+    assert sources["a/bc.md"].source_id == make_source_id(corpus_id, "a/./nested/../bc.md")
+    with pytest.raises(TypeError):
+        sources["a/bc.md"].metadata["relative_path"] = "changed.md"  # type: ignore[index]
+    assert sources["a/bc.md"].metadata["relative_path"] == "a/bc.md"
 
 
 def test_repository_root_cannot_traverse_from_a_nested_directory(tmp_path: Path) -> None:

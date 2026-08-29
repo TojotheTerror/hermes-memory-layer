@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 from typing import Iterable, Literal
@@ -191,6 +191,10 @@ class RepositoryDirtyError(RepositoryDiscoveryError):
     """Raised when apply is requested for an unapproved dirty worktree."""
 
 
+class _RepositorySymlinkError(RepositoryDiscoveryError):
+    """Raised internally when the committed tree entry is a symlink."""
+
+
 def _run_git(root: Path, arguments: list[str], *, ok_returncodes: tuple[int, ...] = (0,)) -> str:
     try:
         completed = subprocess.run(
@@ -205,6 +209,76 @@ def _run_git(root: Path, arguments: list[str], *, ok_returncodes: tuple[int, ...
     if completed.returncode not in ok_returncodes:
         raise RepositoryDiscoveryError("unable to inspect repository")
     return completed.stdout.strip()
+
+
+def _validate_ref(ref: str) -> None:
+    if not ref or ref.startswith("-") or any(ord(character) < 32 for character in ref):
+        raise RepositoryDiscoveryError("unable to inspect repository")
+
+
+def _validate_repository_relative_path(relative_path: str) -> None:
+    normalized = PurePosixPath(relative_path).as_posix()
+    if (
+        not relative_path
+        or "\x00" in relative_path
+        or relative_path.startswith("/")
+        or normalized != relative_path
+        or any(part in {"", ".", ".."} for part in PurePosixPath(relative_path).parts)
+    ):
+        raise RepositoryDiscoveryError("unable to inspect repository")
+
+
+def _read_commit_blob(root: Path, revision: str, relative_path: str) -> bytes:
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
+        raise RepositoryDiscoveryError("unable to inspect repository")
+    _validate_repository_relative_path(relative_path)
+    try:
+        encoded_path = relative_path.encode("utf-8")
+        tree_entry = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-tree",
+                "-z",
+                "--full-tree",
+                revision,
+                "--",
+                relative_path,
+            ],
+            check=False,
+            capture_output=True,
+        )
+        if tree_entry.returncode != 0 or not isinstance(tree_entry.stdout, bytes):
+            raise RepositoryDiscoveryError("unable to inspect repository")
+        records = tree_entry.stdout.split(b"\x00")
+        if len(records) != 2 or records[1] or b"\t" not in records[0]:
+            raise RepositoryDiscoveryError("unable to inspect repository")
+        metadata, listed_path = records[0].split(b"\t", 1)
+        fields = metadata.split(b" ")
+        if len(fields) != 3 or listed_path != encoded_path:
+            raise RepositoryDiscoveryError("unable to inspect repository")
+        mode, object_type, object_id = fields
+        if mode == b"120000":
+            raise _RepositorySymlinkError("unable to inspect repository")
+        if (
+            mode not in {b"100644", b"100755"}
+            or object_type != b"blob"
+            or not re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", object_id)
+        ):
+            raise RepositoryDiscoveryError("unable to inspect repository")
+        blob = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "blob", object_id.decode("ascii")],
+            check=False,
+            capture_output=True,
+        )
+    except _RepositorySymlinkError:
+        raise
+    except (OSError, UnicodeError, ValueError) as error:
+        raise RepositoryDiscoveryError("unable to inspect repository") from error
+    if blob.returncode != 0 or not isinstance(blob.stdout, bytes):
+        raise RepositoryDiscoveryError("unable to inspect repository")
+    return blob.stdout
 
 
 def _matches(path: str, patterns: Iterable[str]) -> bool:
@@ -566,6 +640,8 @@ def discover_repository(
     """Discover approved paths and resolve the exact commit represented by *ref*."""
 
     root_path = Path(root).expanduser().resolve(strict=True)
+    _validate_ref(ref)
+    active_policy = policy or SourcePolicy()
     top_level = Path(_run_git(root_path, ["rev-parse", "--show-toplevel"])).resolve(strict=True)
     if top_level != root_path:
         raise RepositoryDiscoveryError("repository root must be the Git top level")
@@ -577,7 +653,9 @@ def discover_repository(
         root_path,
         ["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
     )
-    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision) or not re.fullmatch(
+        r"[0-9a-f]{40}|[0-9a-f]{64}", head_revision
+    ):
         raise RepositoryDiscoveryError("Git did not return a valid commit identifier")
     if revision != head_revision:
         raise RepositoryDiscoveryError("selected ref must match the checked-out commit")
@@ -592,7 +670,7 @@ def discover_repository(
     dirty = bool(_run_git(root_path, ["status", "--porcelain=v1", "--untracked-files=all", "--"]))
     if for_apply and dirty and not allow_dirty:
         raise RepositoryDirtyError("apply requires a clean worktree unless allow_dirty is set")
-    discovered = discover_sources(root_path, policy, for_apply=for_apply, repository=True)
+    discovered = discover_sources(root_path, active_policy, for_apply=for_apply, repository=True)
     remote = normalize_github_remote(
         _run_git(
             root_path,
@@ -611,8 +689,25 @@ def discover_repository(
             rejected.append(RejectedSource(relative_path, "repository_symlink"))
             continue
         try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
+            if remote is not None and not dirty:
+                content = _read_commit_blob(root_path, revision, relative_path)
+                if len(content) > active_policy.max_file_size_bytes:
+                    rejected.append(RejectedSource(relative_path, "max_file_size"))
+                    continue
+                if _looks_binary(content):
+                    rejected.append(RejectedSource(relative_path, "binary_content"))
+                    continue
+                content_rule = _secret_content_rule(content) or _generated_content_rule(content)
+                if content_rule:
+                    rejected.append(RejectedSource(relative_path, content_rule))
+                    continue
+                text = content.decode("utf-8")
+            else:
+                text = path.read_text(encoding="utf-8")
+        except _RepositorySymlinkError:
+            rejected.append(RejectedSource(relative_path, "repository_symlink"))
+            continue
+        except (OSError, UnicodeError, RepositoryDiscoveryError):
             rejected.append(RejectedSource(relative_path, "detection_error"))
             continue
         content_kind, language = _content_kind_and_language(path)
