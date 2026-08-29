@@ -35,6 +35,9 @@ CHUNK_FIELDS = [
     ("corpus_id", "STRING", "REQUIRED"),
     ("user_id", "STRING", "REQUIRED"),
     ("agent_name", "STRING", "REQUIRED"),
+    ("source_kind", "STRING", "REQUIRED"),
+    ("content_kind", "STRING", "REQUIRED"),
+    ("relative_path", "STRING", "REQUIRED"),
     ("ordinal", "INT64", "REQUIRED"),
     ("content", "STRING", "REQUIRED"),
     ("contextual_content", "STRING", "REQUIRED"),
@@ -122,6 +125,23 @@ def test_document_table_contracts_match_python_sql_and_terraform_json(
     assert _json_fields(terraform_schema) == expected_fields
     assert _cluster_fields(python_ddl) == cluster_fields
     assert _cluster_fields(sql_ddl, table_name) == cluster_fields
+
+
+def test_document_chunk_schema_denormalizes_required_source_retrieval_fields():
+    # Integration contract: Task8 chunk row writers must populate these REQUIRED fields.
+    required_source_fields = {
+        ("source_kind", "STRING", "REQUIRED"),
+        ("content_kind", "STRING", "REQUIRED"),
+        ("relative_path", "STRING", "REQUIRED"),
+    }
+    schemas = (
+        _ddl_fields(bigquery_store.DDL_DOCUMENT_CHUNKS, "document_chunks"),
+        _ddl_fields((ROOT / "bigquery" / "schema.sql").read_text(), "document_chunks"),
+        _json_fields(ROOT / "terraform" / "schemas" / "document_chunks.json"),
+    )
+
+    for schema in schemas:
+        assert required_source_fields <= set(schema)
 
 
 def test_terraform_pins_supported_cli_and_google_provider_series():
@@ -221,6 +241,49 @@ class _FakeSearchClient:
         return _FakeSearchJob(self.rows)
 
 
+def test_search_document_chunks_uses_direct_base_table_query(monkeypatch):
+    client = _FakeSearchClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(
+        project="test-project",
+        bq_dataset="test_dataset",
+        document_embedding_model="test-model",
+        document_embedding_dimensions=3,
+    )
+
+    bigquery_store.search_document_chunks(
+        [0.25, -0.5, 1],
+        user_id="user",
+        agent_name="agent",
+        corpus_id="corpus",
+        source_kind="repository",
+        content_kind="markdown",
+        top_k=7,
+        cfg=cfg,
+    )
+
+    sql = client.queries[0][0]
+    base_query_match = re.search(
+        r"FROM VECTOR_SEARCH\(\s*"
+        r"\(\s*(SELECT\b.*?\bFROM\s+"
+        r"`test-project\.test_dataset\.document_chunks`\s+AS\s+chunks\s+"
+        r"WHERE\b.*?)\s*\),\s*'embedding'",
+        sql,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    assert base_query_match, "first VECTOR_SEARCH argument must query the physical chunks table"
+    base_query = base_query_match.group(1)
+    assert len(re.findall(r"\bSELECT\b", base_query, flags=re.IGNORECASE)) == 1
+    assert len(re.findall(r"\bFROM\b", base_query, flags=re.IGNORECASE)) == 1
+    assert len(re.findall(r"\bWHERE\b", base_query, flags=re.IGNORECASE)) == 1
+    assert not re.search(
+        r"\b(?:WITH|JOIN|UNION|GROUP\s+BY|HAVING|QUALIFY|ORDER\s+BY|LIMIT)\b",
+        base_query,
+        flags=re.IGNORECASE,
+    )
+    assert "filtered_chunks" not in base_query
+
+
 def test_search_document_chunks_uses_exact_prefiltered_parameterized_vector_search(monkeypatch):
     client = _FakeSearchClient()
     monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
@@ -246,7 +309,7 @@ def test_search_document_chunks_uses_exact_prefiltered_parameterized_vector_sear
     assert len(client.queries) == 1
     sql, job_config = client.queries[0]
     normalized_sql = " ".join(sql.split())
-    assert "WITH query_embedding AS" in normalized_sql
+    assert "WITH " not in normalized_sql.upper()
     assert "SELECT @query_embedding AS embedding" in normalized_sql
     assert "FROM VECTOR_SEARCH(" in normalized_sql
     assert "query_column_to_search => 'embedding'" in normalized_sql
@@ -254,23 +317,21 @@ def test_search_document_chunks_uses_exact_prefiltered_parameterized_vector_sear
     assert "options => '{\"use_brute_force\":true}'" in normalized_sql
     assert "VECTOR INDEX" not in normalized_sql.upper()
     assert "FROM `test-project.test_dataset.document_chunks` AS chunks" in normalized_sql
-    assert "JOIN `test-project.test_dataset.document_sources` AS sources" in normalized_sql
+    assert "document_sources" not in normalized_sql
+    assert "chunks.relative_path AS source_path" in normalized_sql
     assert "chunks.is_active = TRUE" in normalized_sql
-    assert "sources.is_active = TRUE" in normalized_sql
+    base_query_end = normalized_sql.index("), 'embedding'")
     for predicate in (
         "chunks.user_id = @user_id",
         "chunks.agent_name = @agent_name",
-        "sources.user_id = @user_id",
-        "sources.agent_name = @agent_name",
         "chunks.embedding_model = @embedding_model",
         "chunks.embedding_dimensions = @embedding_dimensions",
         "chunks.corpus_id = @corpus_id",
-        "sources.corpus_id = @corpus_id",
-        "sources.source_kind = @source_kind",
-        "sources.content_kind = @content_kind",
+        "chunks.source_kind = @source_kind",
+        "chunks.content_kind = @content_kind",
     ):
         assert predicate in normalized_sql
-        assert normalized_sql.index(predicate) < normalized_sql.index("FROM VECTOR_SEARCH(")
+        assert normalized_sql.index(predicate) < base_query_end
     for selected_field in (
         "distance",
         "base.content",
@@ -298,9 +359,7 @@ def test_search_document_chunks_uses_exact_prefiltered_parameterized_vector_sear
         "top_k",
     ):
         assert f"@{parameter_name}" in normalized_sql
-    assert normalized_sql.index("chunks.is_active = TRUE") < normalized_sql.index(
-        "FROM VECTOR_SEARCH("
-    )
+    assert normalized_sql.index("chunks.is_active = TRUE") < base_query_end
     parameter_values = {
         parameter.name: getattr(parameter, "value", getattr(parameter, "values", None))
         for parameter in job_config.query_parameters

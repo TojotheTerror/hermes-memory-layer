@@ -83,6 +83,9 @@ DDL_DOCUMENT_CHUNKS = """CREATE TABLE IF NOT EXISTS `{project}.{dataset}.documen
   corpus_id STRING NOT NULL,
   user_id STRING NOT NULL,
   agent_name STRING NOT NULL,
+  source_kind STRING NOT NULL,
+  content_kind STRING NOT NULL,
+  relative_path STRING NOT NULL,
   ordinal INT64 NOT NULL,
   content STRING NOT NULL,
   contextual_content STRING NOT NULL,
@@ -452,55 +455,15 @@ def search_document_chunks(
         ("content_kind", content_kind),
     ):
         if value is not None:
-            if name == "corpus_id":
-                optional_predicates.extend(
-                    (
-                        "  AND chunks.corpus_id = @corpus_id",
-                        "  AND sources.corpus_id = @corpus_id",
-                    )
-                )
-            else:
-                optional_predicates.append(f"  AND sources.{name} = @{name}")
+            optional_predicates.append(f"    AND chunks.{name} = @{name}")
             query_parameters.append(bigquery.ScalarQueryParameter(name, "STRING", value))
     query_parameters.append(bigquery.ScalarQueryParameter("top_k", "INT64", top_k))
 
     optional_sql = "\n".join(optional_predicates)
     chunks_table = f"`{cfg.project}.{cfg.bq_dataset}.document_chunks`"
-    sources_table = f"`{cfg.project}.{cfg.bq_dataset}.document_sources`"
-    sql = f"""WITH query_embedding AS (
-  SELECT @query_embedding AS embedding
-),
-filtered_chunks AS (
-  SELECT
-    chunks.embedding,
-    chunks.content,
-    chunks.contextual_content,
-    chunks.citation,
-    sources.relative_path AS source_path,
-    chunks.heading_path,
-    chunks.symbol,
-    chunks.start_line,
-    chunks.end_line,
-    chunks.chunk_id,
-    chunks.source_id,
-    chunks.corpus_id
-  FROM {chunks_table} AS chunks
-  JOIN {sources_table} AS sources
-    ON sources.source_id = chunks.source_id
-   AND sources.corpus_id = chunks.corpus_id
-   AND sources.user_id = chunks.user_id
-   AND sources.agent_name = chunks.agent_name
-  WHERE chunks.is_active = TRUE
-    AND sources.is_active = TRUE
-    AND chunks.user_id = @user_id
-    AND chunks.agent_name = @agent_name
-    AND sources.user_id = @user_id
-    AND sources.agent_name = @agent_name
-    AND chunks.embedding_model = @embedding_model
-    AND chunks.embedding_dimensions = @embedding_dimensions
-{optional_sql}
-)
-SELECT
+    # Source finalization and pruning atomically mirror source activation into chunk rows.
+    # Denormalized source fields keep every required predicate in this legal base-table query.
+    sql = f"""SELECT
   distance,
   base.content,
   base.contextual_content,
@@ -514,9 +477,28 @@ SELECT
   base.source_id,
   base.corpus_id
 FROM VECTOR_SEARCH(
-  (SELECT * FROM filtered_chunks),
+  (SELECT
+    chunks.embedding,
+    chunks.content,
+    chunks.contextual_content,
+    chunks.citation,
+    chunks.relative_path AS source_path,
+    chunks.heading_path,
+    chunks.symbol,
+    chunks.start_line,
+    chunks.end_line,
+    chunks.chunk_id,
+    chunks.source_id,
+    chunks.corpus_id
+  FROM {chunks_table} AS chunks
+  WHERE chunks.is_active = TRUE
+    AND chunks.user_id = @user_id
+    AND chunks.agent_name = @agent_name
+    AND chunks.embedding_model = @embedding_model
+    AND chunks.embedding_dimensions = @embedding_dimensions
+{optional_sql}),
   'embedding',
-  (SELECT * FROM query_embedding),
+  (SELECT @query_embedding AS embedding),
   query_column_to_search => 'embedding',
   top_k => @top_k,
   distance_type => 'COSINE',
