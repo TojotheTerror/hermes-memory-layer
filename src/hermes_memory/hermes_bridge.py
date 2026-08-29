@@ -4,11 +4,11 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .bigquery_store import insert_memory
 from .config import HermesMemoryConfig, load_config
-from .memory_bank import append_event, generate_from_contents, generate_from_session, retrieve_memories
+from .memory_bank import generate_from_contents, generate_from_session, retrieve_memories
 
 
 def _local_db_path() -> Path:
@@ -151,11 +151,35 @@ def read_local_memories(limit: int = 50) -> list[dict]:
         return []
 
 
+def _retrieve_bigquery_memories(
+    user_id: str, *, top_k: int, cfg: HermesMemoryConfig
+) -> list[dict]:
+    """Retrieve structured BigQuery hits when a client is available."""
+    from .bigquery_store import _bq_client, query_memories_sql
+
+    client = _bq_client(cfg)
+    if client is None:
+        return []
+    sql = query_memories_sql(user_id, limit=top_k, cfg=cfg)
+    rows = list(client.query(sql).result())
+    return [{"fact": row["fact"], "source": "bigquery", "raw": dict(row)} for row in rows]
+
+
 class HermesBridge:
     """Offline-safe bridge between local Hermes and GCP memory layer."""
 
-    def __init__(self, cfg: HermesMemoryConfig | None = None):
+    def __init__(
+        self,
+        cfg: HermesMemoryConfig | None = None,
+        *,
+        memory_bank_retriever: Callable[..., list[dict]] = retrieve_memories,
+        bigquery_retriever: Callable[..., list[dict]] = _retrieve_bigquery_memories,
+        local_memory_reader: Callable[..., list[dict]] = read_local_memories,
+    ):
         self.cfg = cfg or load_config()
+        self._memory_bank_retriever = memory_bank_retriever
+        self._bigquery_retriever = bigquery_retriever
+        self._local_memory_reader = local_memory_reader
 
     @property
     def memory_bank_name(self) -> str | None:
@@ -167,7 +191,9 @@ class HermesBridge:
         bank_hits: list[dict] = []
         if self.memory_bank_name:
             try:
-                bank_hits = retrieve_memories(self.memory_bank_name, scope, query, top_k=top_k, cfg=self.cfg)
+                bank_hits = self._memory_bank_retriever(
+                    self.memory_bank_name, scope, query, top_k=top_k, cfg=self.cfg
+                )
             except Exception as e:
                 print(f"[bridge] Memory Bank retrieve failed: {e}")
         else:
@@ -180,17 +206,12 @@ class HermesBridge:
         # BigQuery structured hits (text match fallback if no embeddings yet)
         bq_hits: list[dict] = []
         try:
-            from .bigquery_store import _bq_client, query_memories_sql
-            client = _bq_client(self.cfg)
-            if client is not None:
-                sql = query_memories_sql(user_id, limit=top_k, cfg=self.cfg)
-                rows = list(client.query(sql).result())
-                bq_hits = [{"fact": r["fact"], "source": "bigquery", "raw": dict(r)} for r in rows]
+            bq_hits = self._bigquery_retriever(user_id, top_k=top_k, cfg=self.cfg)
         except Exception as e:
             print(f"[bridge] BigQuery retrieve failed: {e}")
 
         # Local SQLite as third source (always available)
-        local_hits = read_local_memories(limit=top_k)
+        local_hits = self._local_memory_reader(limit=top_k)
 
         # Merge + dedupe by fact text (case-insensitive)
         seen: set[str] = set()
