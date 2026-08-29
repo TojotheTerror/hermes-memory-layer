@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "queries": [
+    {
+      "id": "durable-memory-layers",
+      "query": "Which durable layers does the synthetic service keep?",
+      "expected_source_path": "Operations/agent-memory.md",
+      "expected_heading": "Layout"
+    },
+    {
+      "id": "configured-retrieval-limit",
+      "query": "What retrieval limit appears in the sample memory configuration?",
+      "expected_source_path": "Operations/agent-memory.md",
+      "expected_heading": "Layout"
+    },
+    {
+      "id": "replay-missing-chunks",
+      "query": "How should missing chunks be replayed during storage recovery?",
+      "expected_source_path": "Operations/agent-memory.md",
+      "expected_heading": "Recovery"
+    },
+    {
+      "id": "verify-recovery-identity",
+      "query": "What identifier should remain stable after a successful replay?",
+      "expected_source_path": "Operations/agent-memory.md",
+      "expected_heading": "Verification"
+    },
+    {
+      "id": "canonical-root-check",
+      "query": "What was compared with the stored corpus identity?",
+      "expected_source_path": "Operations/agent-memory.md",
+      "expected_heading": "Oversized Incident Narrative"
+    },
+    {
+      "id": "line-citation-requirements",
+      "query": "Which location details make a source citation directly inspectable?",
+      "expected_source_path": "Operations/agent-memory.md",
+      "expected_heading": "Oversized Incident Narrative"
+    },
+    {
+      "id": "dry-run-report-fields",
+      "query": "Which counts and estimates belong in the synthetic dry-run report?",
+      "expected_source_path": "Operations/agent-memory.md",
+      "expected_heading": "Oversized Incident Narrative"
+    },
+    {
+      "id": "evaluation-measurements",
+      "query": "Which measurements does the pilot evaluator record?",
+      "expected_source_path": "Operations/agent-memory.md",
+      "expected_heading": "Oversized Incident Narrative"
+    },
+    {
+      "id": "runtime-recovery-resume",
+      "query": "When should the synthetic runtime resume after draining its queue?",
+      "expected_source_path": "Operations/agent-memory.md",
+      "expected_heading": "Recovery"
+    },
+    {
+      "id": "construct-empty-store",
+      "query": "Which function constructs an empty in-memory fixture store?",
+      "expected_source_path": "main.go",
+      "expected_symbol": "NewStore"
+    },
+    {
+      "id": "reject-empty-memory-id",
+      "query": "Which method rejects a memory record without an identifier?",
+      "expected_source_path": "main.go",
+      "expected_symbol": "(*InMemoryStore).Put"
+    },
+    {
+      "id": "sort-snapshot-records",
+      "query": "Which method returns records sorted by identifier?",
+      "expected_source_path": "main.go",
+      "expected_symbol": "(*InMemoryStore).Snapshot"
+    },
+    {
+      "id": "run-fixture-program",
+      "query": "What command runs the synthetic fixture program?",
+      "expected_source_path": "README.md",
+      "expected_heading": "Usage"
+    },
+    {
+      "id": "repeated-recovery-heading",
+      "query": "Why does the repository fixture repeat its recovery heading?",
+      "expected_source_path": "README.md",
+      "expected_heading": "Recovery"
+    }
+  ]
+}
