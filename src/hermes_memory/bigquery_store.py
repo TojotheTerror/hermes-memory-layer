@@ -257,7 +257,7 @@ USING (SELECT @source_id AS source_id, @user_id AS user_id, @agent_name AS agent
 ON target.source_id = incoming.source_id
   AND target.user_id = incoming.user_id
   AND target.agent_name = incoming.agent_name
-WHEN MATCHED THEN UPDATE SET
+WHEN MATCHED AND NOT target.is_active THEN UPDATE SET
   corpus_id = @corpus_id,
   source_kind = @source_kind,
   content_kind = @content_kind,
@@ -266,7 +266,6 @@ WHEN MATCHED THEN UPDATE SET
   revision = @revision,
   content_hash = @content_hash,
   metadata = PARSE_JSON(@metadata),
-  is_active = TRUE,
   last_seen_at = CURRENT_TIMESTAMP(),
   updated_at = CURRENT_TIMESTAMP()
 WHEN NOT MATCHED THEN INSERT
@@ -275,7 +274,7 @@ WHEN NOT MATCHED THEN INSERT
    first_seen_at, last_seen_at, updated_at)
 VALUES
   (@source_id, @corpus_id, @user_id, @agent_name, @source_kind, @content_kind,
-   @relative_path, @source_uri, @revision, @content_hash, PARSE_JSON(@metadata), TRUE,
+   @relative_path, @source_uri, @revision, @content_hash, PARSE_JSON(@metadata), FALSE,
    CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())"""
     job_config = _bq.QueryJobConfig(
         query_parameters=[
@@ -365,58 +364,89 @@ def finalize_source_revision(
     source_id: str,
     active_chunk_ids: list[str],
     *,
+    source: dict,
     user_id: str,
     agent_name: str,
     cfg: HermesMemoryConfig | None = None,
 ) -> None:
-    """Activate a complete revision and only then retire its unmatched chunks."""
+    """Atomically activate complete chunks and their source revision metadata."""
+    if source["source_id"] != source_id:
+        raise ValueError("source_id does not match source metadata")
+
     cfg = cfg or load_config()
     _validate_ddl_identifiers(cfg)
     client = _bq_client(cfg)
     if client is None:
         raise RuntimeError("BigQuery client unavailable")
 
+    import json as _json
     from google.cloud import bigquery as _bq
 
     chunk_ids = list(dict.fromkeys(active_chunk_ids))
-    table = f"`{cfg.project}.{cfg.bq_dataset}.document_chunks`"
-    parameters = [
-        _bq.ScalarQueryParameter("source_id", "STRING", source_id),
-        _bq.ScalarQueryParameter("user_id", "STRING", user_id),
-        _bq.ScalarQueryParameter("agent_name", "STRING", agent_name),
-        _bq.ArrayQueryParameter("active_chunk_ids", "STRING", chunk_ids),
-    ]
-    proof_sql = f"""SELECT COUNT(DISTINCT chunk_id) AS present_count
-FROM {table}
-WHERE source_id = @source_id
-  AND user_id = @user_id
-  AND agent_name = @agent_name
-  AND chunk_id IN UNNEST(@active_chunk_ids)"""
-    rows = list(
-        client.query(
-            proof_sql,
-            job_config=_bq.QueryJobConfig(query_parameters=parameters),
-        ).result()
-    )
-    present_count = int(dict(rows[0])["present_count"]) if rows else 0
-    if present_count != len(chunk_ids):
-        missing_count = len(chunk_ids) - present_count
-        noun = "chunk" if missing_count == 1 else "chunks"
-        raise RuntimeError(
-            f"missing {missing_count} expected {noun}; source revision not finalized"
-        )
-
-    activate_sql = f"""UPDATE {table}
+    chunks = f"`{cfg.project}.{cfg.bq_dataset}.document_chunks`"
+    sources = f"`{cfg.project}.{cfg.bq_dataset}.document_sources`"
+    sql = f"""BEGIN TRANSACTION;
+ASSERT (
+  SELECT COUNT(DISTINCT chunk_id)
+  FROM {chunks}
+  WHERE source_id = @source_id
+    AND user_id = @user_id
+    AND agent_name = @agent_name
+    AND chunk_id IN UNNEST(@active_chunk_ids)
+) = ARRAY_LENGTH(@active_chunk_ids)
+AS 'expected chunks incomplete; source revision not finalized';
+UPDATE {chunks}
 SET is_active = chunk_id IN UNNEST(@active_chunk_ids),
     updated_at = CURRENT_TIMESTAMP()
 WHERE source_id = @source_id
   AND user_id = @user_id
   AND agent_name = @agent_name
-  AND (is_active OR chunk_id IN UNNEST(@active_chunk_ids))"""
-    client.query(
-        activate_sql,
-        job_config=_bq.QueryJobConfig(query_parameters=parameters),
-    ).result()
+  AND (is_active OR chunk_id IN UNNEST(@active_chunk_ids));
+MERGE {sources} AS target
+USING (SELECT @source_id AS source_id, @user_id AS user_id, @agent_name AS agent_name) AS incoming
+ON target.source_id = incoming.source_id
+  AND target.user_id = incoming.user_id
+  AND target.agent_name = incoming.agent_name
+WHEN MATCHED THEN UPDATE SET
+  corpus_id = @corpus_id,
+  source_kind = @source_kind,
+  content_kind = @content_kind,
+  relative_path = @relative_path,
+  source_uri = @source_uri,
+  revision = @revision,
+  content_hash = @content_hash,
+  metadata = PARSE_JSON(@metadata),
+  is_active = TRUE,
+  last_seen_at = CURRENT_TIMESTAMP(),
+  updated_at = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT
+  (source_id, corpus_id, user_id, agent_name, source_kind, content_kind,
+   relative_path, source_uri, revision, content_hash, metadata, is_active,
+   first_seen_at, last_seen_at, updated_at)
+VALUES
+  (@source_id, @corpus_id, @user_id, @agent_name, @source_kind, @content_kind,
+   @relative_path, @source_uri, @revision, @content_hash, PARSE_JSON(@metadata), TRUE,
+   CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP());
+COMMIT TRANSACTION;"""
+    job_config = _bq.QueryJobConfig(
+        query_parameters=[
+            _bq.ScalarQueryParameter("source_id", "STRING", source_id),
+            _bq.ScalarQueryParameter("corpus_id", "STRING", source["corpus_id"]),
+            _bq.ScalarQueryParameter("user_id", "STRING", user_id),
+            _bq.ScalarQueryParameter("agent_name", "STRING", agent_name),
+            _bq.ScalarQueryParameter("source_kind", "STRING", source["source_kind"]),
+            _bq.ScalarQueryParameter("content_kind", "STRING", source["content_kind"]),
+            _bq.ScalarQueryParameter("relative_path", "STRING", source["relative_path"]),
+            _bq.ScalarQueryParameter("source_uri", "STRING", source["source_uri"]),
+            _bq.ScalarQueryParameter("revision", "STRING", source["revision"]),
+            _bq.ScalarQueryParameter("content_hash", "STRING", source["content_hash"]),
+            _bq.ScalarQueryParameter(
+                "metadata", "STRING", _json.dumps(source.get("metadata") or {})
+            ),
+            _bq.ArrayQueryParameter("active_chunk_ids", "STRING", chunk_ids),
+        ]
+    )
+    client.query(sql, job_config=job_config).result()
 
 
 def deactivate_missing_sources(

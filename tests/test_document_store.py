@@ -221,29 +221,79 @@ class _StoreFakeClient:
         return []
 
 
-class _RevisionFakeClient(_StoreFakeClient):
-    def __init__(self, chunks):
+class _LifecycleFakeClient(_StoreFakeClient):
+    def __init__(self, sources, chunks):
         super().__init__()
+        self.sources = {source["source_id"]: dict(source) for source in sources}
         self.chunks = {chunk["chunk_id"]: dict(chunk) for chunk in chunks}
 
     def query(self, sql, job_config=None):
         self.queries.append((sql, job_config))
         parameters = _query_parameters(job_config)
-        matching = [
-            chunk
-            for chunk in self.chunks.values()
-            if chunk["source_id"] == parameters["source_id"]
-            and chunk["user_id"] == parameters["user_id"]
-            and chunk["agent_name"] == parameters["agent_name"]
-        ]
-        if "present_count" in sql:
+        source = self.sources.get(parameters["source_id"])
+        if sql.startswith("SELECT source_id, revision, content_hash, is_active"):
+            if source is None:
+                return _FakeJob([])
+            return _FakeJob(
+                [
+                    {
+                        "source_id": source["source_id"],
+                        "revision": source["revision"],
+                        "content_hash": source["content_hash"],
+                        "is_active": source["is_active"],
+                    }
+                ]
+            )
+        if sql.startswith("BEGIN TRANSACTION"):
             expected = set(parameters["active_chunk_ids"])
-            present_count = len({chunk["chunk_id"] for chunk in matching} & expected)
-            return _FakeJob([{"present_count": present_count}])
-        if "SET is_active" in sql:
-            active = set(parameters["active_chunk_ids"])
+            matching = [
+                chunk
+                for chunk in self.chunks.values()
+                if chunk["source_id"] == parameters["source_id"]
+                and chunk["user_id"] == parameters["user_id"]
+                and chunk["agent_name"] == parameters["agent_name"]
+            ]
+            present = {chunk["chunk_id"] for chunk in matching} & expected
+            if "ASSERT" in sql and len(present) != len(expected):
+                missing = len(expected) - len(present)
+                noun = "chunk" if missing == 1 else "chunks"
+                raise RuntimeError(f"missing {missing} expected {noun}")
             for chunk in matching:
-                chunk["is_active"] = chunk["chunk_id"] in active
+                chunk["is_active"] = chunk["chunk_id"] in expected
+            incoming = {
+                name: value
+                for name, value in parameters.items()
+                if name not in {"active_chunk_ids", "user_id", "agent_name"}
+            }
+            incoming["metadata"] = json.loads(incoming["metadata"])
+            if source is None:
+                source = {}
+                self.sources[parameters["source_id"]] = source
+            source.update(incoming)
+            source.update(
+                user_id=parameters["user_id"],
+                agent_name=parameters["agent_name"],
+                is_active=True,
+            )
+            return _FakeJob([])
+        if sql.startswith("MERGE"):
+            incoming = {
+                name: value
+                for name, value in parameters.items()
+                if name not in {"user_id", "agent_name"}
+            }
+            incoming["metadata"] = json.loads(incoming["metadata"])
+            if source is not None:
+                if "WHEN MATCHED AND NOT target.is_active" not in sql or not source["is_active"]:
+                    source.update(incoming)
+                    source["is_active"] = "is_active = TRUE" in sql
+            else:
+                incoming.update(
+                    user_id=parameters["user_id"],
+                    agent_name=parameters["agent_name"],
+                    is_active="PARSE_JSON(@metadata), TRUE" in sql,
+                )
+                self.sources[parameters["source_id"]] = incoming
             return _FakeJob([])
         raise AssertionError(f"unexpected query: {sql}")
 
@@ -372,6 +422,52 @@ def test_upsert_source_parameterizes_every_source_value(monkeypatch):
     assert json.loads(parameters["metadata"]) == source["metadata"]
 
 
+def test_interrupted_existing_source_keeps_active_revision_and_retries_changed(monkeypatch):
+    old_source = _source(
+        revision="revision-old",
+        content_hash="hash-old",
+        relative_path="notes/old.md",
+        metadata={"label": "old"},
+        is_active=True,
+    )
+    new_source = _source(
+        revision="revision-new",
+        content_hash="hash-new",
+        relative_path="notes/new.md",
+        metadata={"label": "new"},
+    )
+    client = _LifecycleFakeClient(
+        [old_source],
+        [
+            {
+                "chunk_id": "old-active",
+                "source_id": old_source["source_id"],
+                "is_active": True,
+            }
+        ],
+    )
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    assert bigquery_store.upsert_source(new_source, user_id="user-1", agent_name="hermes", cfg=cfg)
+
+    assert client.sources[old_source["source_id"]] == old_source
+    assert client.active_chunk_ids() == {"old-active"}
+    assert bigquery_store.upsert_source(new_source, user_id="user-1", agent_name="hermes", cfg=cfg)
+
+
+def test_interrupted_new_source_is_not_finalized_and_retries_changed(monkeypatch):
+    source = _source(revision="revision-new", content_hash="hash-new")
+    client = _LifecycleFakeClient([], [])
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    assert bigquery_store.upsert_source(source, user_id="user-1", agent_name="hermes", cfg=cfg)
+
+    assert client.sources[source["source_id"]]["is_active"] is False
+    assert bigquery_store.upsert_source(source, user_id="user-1", agent_name="hermes", cfg=cfg)
+
+
 def test_insert_chunks_uses_chunk_ids_as_deterministic_insert_ids(monkeypatch):
     chunks = [_chunk(), _chunk(chunk_id="chunk-2", ordinal=1)]
     client = _StoreFakeClient()
@@ -425,27 +521,106 @@ def test_insert_chunks_rejects_embedding_contract_before_client_writes(monkeypat
     assert client.inserts == []
 
 
-def test_finalize_source_revision_preserves_old_active_chunks_when_new_set_is_incomplete(
+def test_finalize_source_revision_atomically_activates_chunks_and_source_metadata(monkeypatch):
+    old_source = _source(
+        source_id="source'; --",
+        revision="revision-old",
+        content_hash="hash-old",
+        relative_path="notes/old.md",
+        metadata={"label": "old"},
+        user_id="user'; --",
+        agent_name="hermes",
+        is_active=True,
+    )
+    new_source = _source(
+        source_id="source'; --",
+        revision="revision-new",
+        content_hash="hash-new",
+        relative_path="notes/new'; --.md",
+        metadata={"label": "new"},
+    )
+    chunks = [
+        {
+            "chunk_id": "old-active",
+            "source_id": new_source["source_id"],
+            "user_id": "user'; --",
+            "agent_name": "hermes",
+            "is_active": True,
+        },
+        {
+            "chunk_id": "new-1'; --",
+            "source_id": new_source["source_id"],
+            "user_id": "user'; --",
+            "agent_name": "hermes",
+            "is_active": False,
+        },
+    ]
+    client = _LifecycleFakeClient([old_source], chunks)
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    bigquery_store.finalize_source_revision(
+        new_source["source_id"],
+        ["new-1'; --"],
+        source=new_source,
+        user_id="user'; --",
+        agent_name="hermes",
+        cfg=cfg,
+    )
+
+    assert client.active_chunk_ids() == {"new-1'; --"}
+    persisted = client.sources[new_source["source_id"]]
+    assert {key: persisted[key] for key in new_source} == new_source
+    assert persisted["is_active"] is True
+    assert len(client.queries) == 1
+    sql, job_config = client.queries[0]
+    assert "BEGIN TRANSACTION" in sql and "COMMIT TRANSACTION" in sql
+    assert "document_chunks" in sql and "document_sources" in sql
+    for value in (*new_source.values(), "user'; --", "new-1'; --"):
+        if isinstance(value, str):
+            assert value not in sql
+    parameters = _query_parameters(job_config)
+    assert parameters["revision"] == "revision-new"
+    assert parameters["content_hash"] == "hash-new"
+    assert parameters["active_chunk_ids"] == ["new-1'; --"]
+    assert json.loads(parameters["metadata"]) == {"label": "new"}
+
+
+def test_finalize_source_revision_preserves_source_and_chunks_when_new_set_is_incomplete(
     monkeypatch,
 ):
-    client = _RevisionFakeClient(
-        [
-            {
-                "chunk_id": "old-active",
-                "source_id": "source'; --",
-                "user_id": "user'; --",
-                "agent_name": "hermes",
-                "is_active": True,
-            },
-            {
-                "chunk_id": "new-present",
-                "source_id": "source'; --",
-                "user_id": "user'; --",
-                "agent_name": "hermes",
-                "is_active": False,
-            },
-        ]
+    old_source = _source(
+        source_id="source'; --",
+        revision="revision-old",
+        content_hash="hash-old",
+        metadata={"label": "old"},
+        user_id="user'; --",
+        agent_name="hermes",
+        is_active=True,
     )
+    new_source = _source(
+        source_id="source'; --",
+        revision="revision-new",
+        content_hash="hash-new",
+        metadata={"label": "new"},
+    )
+    chunks = [
+        {
+            "chunk_id": "old-active",
+            "source_id": "source'; --",
+            "user_id": "user'; --",
+            "agent_name": "hermes",
+            "is_active": True,
+        },
+        {
+            "chunk_id": "new-present",
+            "source_id": "source'; --",
+            "user_id": "user'; --",
+            "agent_name": "hermes",
+            "is_active": False,
+        },
+    ]
+    client = _LifecycleFakeClient([old_source], chunks)
     monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
     cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
 
@@ -453,11 +628,13 @@ def test_finalize_source_revision_preserves_old_active_chunks_when_new_set_is_in
         bigquery_store.finalize_source_revision(
             "source'; --",
             ["new-present", "new-missing'; --"],
+            source=new_source,
             user_id="user'; --",
             agent_name="hermes",
             cfg=cfg,
         )
 
+    assert client.sources[old_source["source_id"]] == old_source
     assert client.active_chunk_ids() == {"old-active"}
     assert len(client.queries) == 1
     sql, job_config = client.queries[0]
@@ -470,6 +647,7 @@ def test_finalize_source_revision_preserves_old_active_chunks_when_new_set_is_in
 
 
 def test_finalize_source_revision_switches_active_set_only_after_completeness_proof(monkeypatch):
+    source = _source(revision="revision-2", content_hash="hash-2")
     chunks = [
         {
             "chunk_id": "old-active",
@@ -493,26 +671,26 @@ def test_finalize_source_revision_switches_active_set_only_after_completeness_pr
             "is_active": False,
         },
     ]
-    client = _RevisionFakeClient(chunks)
+    client = _LifecycleFakeClient([], chunks)
     monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
     cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
 
     bigquery_store.finalize_source_revision(
         "source-1",
         ["new-1", "new-2"],
+        source=source,
         user_id="user-1",
         agent_name="hermes",
         cfg=cfg,
     )
 
     assert client.active_chunk_ids() == {"new-1", "new-2"}
-    assert len(client.queries) == 2
-    assert "present_count" in client.queries[0][0]
-    assert "SET is_active" in client.queries[1][0]
-    for sql, job_config in client.queries:
-        assert "source-1" not in sql
-        assert "new-1" not in sql
-        assert _query_parameters(job_config)["active_chunk_ids"] == ["new-1", "new-2"]
+    assert len(client.queries) == 1
+    sql, job_config = client.queries[0]
+    assert "ASSERT" in sql and "SET is_active" in sql
+    assert "source-1" not in sql
+    assert "new-1" not in sql
+    assert _query_parameters(job_config)["active_chunk_ids"] == ["new-1", "new-2"]
 
 
 def test_deactivate_missing_sources_requires_explicit_prune(monkeypatch):
