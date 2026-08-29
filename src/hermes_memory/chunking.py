@@ -9,7 +9,7 @@ from markdown_it.token import Token
 
 from hermes_memory.documents import AtomicUnit
 
-__all__ = ["AtomicUnit", "parse_markdown_units"]
+__all__ = ["AtomicUnit", "pack_markdown_units", "parse_markdown_units"]
 
 _MARKDOWN = MarkdownIt("commonmark")
 _UNIT_TOKEN_TYPES = {
@@ -69,8 +69,153 @@ def _unit(lines: list[str], start: int, end: int, heading_path: tuple[str, ...])
         symbol=None,
         start_line=start + 1,
         end_line=end,
-        token_estimate=max(1, ceil(len(source) / 4)),
+        token_estimate=_token_estimate(source),
     )
+
+
+def _token_estimate(text: str) -> int:
+    return max(1, ceil(len(text) / 4))
+
+
+def _pack(units: list[AtomicUnit]) -> AtomicUnit:
+    text = "".join(unit.text for unit in units)
+    first = units[0]
+    return AtomicUnit(
+        text=text,
+        heading_path=first.heading_path,
+        symbol=first.symbol,
+        start_line=first.start_line,
+        end_line=units[-1].end_line,
+        token_estimate=_token_estimate(text),
+    )
+
+
+def _line_break_ends(text: str) -> list[int]:
+    ends: list[int] = []
+    index = 0
+    while index < len(text):
+        if text[index] == "\r":
+            index += 1
+            if index < len(text) and text[index] == "\n":
+                index += 1
+            ends.append(index)
+        elif text[index] == "\n":
+            index += 1
+            ends.append(index)
+        else:
+            index += 1
+    return ends
+
+
+def _hard_split(unit: AtomicUnit, max_tokens: int) -> list[AtomicUnit]:
+    if _token_estimate(unit.text) <= max_tokens:
+        return [unit]
+
+    max_characters = max_tokens * 4
+    line_break_ends = _line_break_ends(unit.text)
+    pieces: list[AtomicUnit] = []
+    for start in range(0, len(unit.text), max_characters):
+        end = min(start + max_characters, len(unit.text))
+        text = unit.text[start:end]
+        start_line = unit.start_line + sum(boundary <= start for boundary in line_break_ends)
+        end_line = unit.start_line + sum(boundary <= end - 1 for boundary in line_break_ends)
+        pieces.append(
+            AtomicUnit(
+                text=text,
+                heading_path=unit.heading_path,
+                symbol=unit.symbol,
+                start_line=start_line,
+                end_line=end_line,
+                token_estimate=_token_estimate(text),
+            )
+        )
+    return pieces
+
+
+def _pack_section(
+    units: list[AtomicUnit],
+    target_tokens: int,
+    max_tokens: int,
+    overlap_tokens: int,
+) -> list[AtomicUnit]:
+    expanded: list[tuple[AtomicUnit, bool]] = []
+    for unit in units:
+        pieces = _hard_split(unit, max_tokens)
+        expanded.extend((piece, len(pieces) == 1) for piece in pieces)
+
+    if _token_estimate("".join(item.text for item, _ in expanded)) <= max_tokens:
+        return [_pack([item for item, _ in expanded])]
+
+    groups: list[list[tuple[AtomicUnit, bool]]] = []
+    current: list[tuple[AtomicUnit, bool]] = []
+    for item in expanded:
+        candidate = "".join(unit.text for unit, _ in [*current, item])
+        if current and _token_estimate(candidate) > max_tokens:
+            groups.append(current)
+            current = []
+        current.append(item)
+        if _token_estimate("".join(unit.text for unit, _ in current)) >= target_tokens:
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+
+    packed: list[AtomicUnit] = []
+    for index, group in enumerate(groups):
+        overlap: list[tuple[AtomicUnit, bool]] = []
+        if index:
+            for item in reversed(groups[index - 1]):
+                if not item[1]:
+                    break
+                candidate_overlap = [item, *overlap]
+                overlap_text = "".join(unit.text for unit, _ in candidate_overlap)
+                chunk_text = overlap_text + "".join(unit.text for unit, _ in group)
+                if (
+                    _token_estimate(overlap_text) > overlap_tokens
+                    or _token_estimate(chunk_text) > max_tokens
+                ):
+                    break
+                overlap = candidate_overlap
+        packed.append(_pack([item for item, _ in [*overlap, *group]]))
+    return packed
+
+
+def _validate_packing_limits(target_tokens: int, max_tokens: int, overlap_tokens: int) -> None:
+    values = (target_tokens, max_tokens, overlap_tokens)
+    if not all(type(value) is int for value in values) or not (
+        0 <= overlap_tokens < target_tokens <= max_tokens
+    ):
+        raise ValueError(
+            "packing limits must satisfy 0 <= overlap_tokens < target_tokens <= max_tokens"
+        )
+
+
+def pack_markdown_units(
+    units: list[AtomicUnit],
+    *,
+    target_tokens: int,
+    max_tokens: int,
+    overlap_tokens: int = 0,
+) -> list[AtomicUnit]:
+    """Pack contiguous Markdown sections into immutable structural chunks."""
+    _validate_packing_limits(target_tokens, max_tokens, overlap_tokens)
+    if not units:
+        return []
+
+    sections: list[list[AtomicUnit]] = []
+    for unit in units:
+        if sections and (unit.heading_path, unit.symbol) == (
+            sections[-1][0].heading_path,
+            sections[-1][0].symbol,
+        ):
+            sections[-1].append(unit)
+        else:
+            sections.append([unit])
+    return [
+        chunk
+        for section in sections
+        for chunk in _pack_section(section, target_tokens, max_tokens, overlap_tokens)
+    ]
 
 
 def _heading_text(tokens: list[Token], index: int) -> str:
