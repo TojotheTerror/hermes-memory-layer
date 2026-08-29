@@ -35,11 +35,7 @@ def _frontmatter_end(lines: list[str]) -> int:
     return 0
 
 
-def _unit(
-    lines: list[str], start: int, end: int, heading_path: tuple[str, ...]
-) -> AtomicUnit:
-    while end > start and not lines[end - 1].strip():
-        end -= 1
+def _unit(lines: list[str], start: int, end: int, heading_path: tuple[str, ...]) -> AtomicUnit:
     source = "".join(lines[start:end])
     return AtomicUnit(
         text=source,
