@@ -313,9 +313,9 @@ def insert_chunks(
     cfg: HermesMemoryConfig | None = None,
 ) -> int:
     """Insert inactive chunks using chunk identities as retry-stable insert IDs."""
+    _validate_embedding_dimensions(embedding_dimensions)
     if not chunks:
         return 0
-    _validate_embedding_dimensions(embedding_dimensions)
     cfg = cfg or load_config()
     _validate_ddl_identifiers(cfg)
     for chunk in chunks:
