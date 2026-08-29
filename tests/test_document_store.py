@@ -45,7 +45,6 @@ CHUNK_FIELDS = [
     ("citation", "STRING", "REQUIRED"),
     ("embedding", "FLOAT64", "REPEATED"),
     ("embedding_model", "STRING", "REQUIRED"),
-    ("embedding_task_type", "STRING", "REQUIRED"),
     ("embedding_dimensions", "INT64", "REQUIRED"),
     ("metadata", "JSON", "NULLABLE"),
     ("is_active", "BOOL", "REQUIRED"),

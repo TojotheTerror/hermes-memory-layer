@@ -77,7 +77,6 @@ CREATE TABLE IF NOT EXISTS `{{project}}.{{dataset}}.document_chunks` (
   citation STRING NOT NULL,
   embedding ARRAY<FLOAT64> NOT NULL,
   embedding_model STRING NOT NULL,
-  embedding_task_type STRING NOT NULL,
   embedding_dimensions INT64 NOT NULL,
   metadata JSON,
   is_active BOOL NOT NULL,
