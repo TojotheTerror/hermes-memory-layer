@@ -8,6 +8,9 @@ from pathlib import Path
 import re
 import subprocess
 from typing import Iterable, Literal
+from urllib.parse import quote, unquote, urlsplit
+
+from .documents import SourceDocument, make_corpus_id, make_source_id, sha256_text
 
 
 DEFAULT_EXCLUDED_DIRECTORIES = frozenset(
@@ -40,6 +43,85 @@ COMMON_LOCK_FILE_NAMES = frozenset(
 PERSONAL_PATH_CATEGORIES = frozenset(
     {"finance", "tax", "taxes", "medical", "household", "identity", "legal"}
 )
+
+_GITHUB_COMPONENT = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
+
+_CODE_LANGUAGES = {
+    ".c": "c",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".cs": "csharp",
+    ".go": "go",
+    ".java": "java",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".kt": "kotlin",
+    ".php": "php",
+    ".py": "python",
+    ".rb": "ruby",
+    ".rs": "rust",
+    ".sh": "shell",
+    ".swift": "swift",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+}
+
+_MARKDOWN_EXTENSIONS = frozenset({".md", ".markdown", ".mdown", ".mkd"})
+
+
+def normalize_github_remote(remote: str) -> str | None:
+    """Return a credential-free canonical URL for a recognized GitHub remote."""
+
+    owner_repo: tuple[str, str] | None = None
+    scp_match = re.fullmatch(r"git@github\.com:([^/?#]+)/([^/?#]+)", remote)
+    if scp_match:
+        owner_repo = scp_match.group(1), scp_match.group(2)
+    else:
+        try:
+            parsed = urlsplit(remote)
+            port = parsed.port
+        except ValueError:
+            return None
+        if parsed.query or parsed.fragment or port is not None:
+            return None
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").lower()
+        if host != "github.com":
+            return None
+        if scheme == "https":
+            if parsed.username is not None or parsed.password is not None:
+                return None
+        elif scheme == "ssh":
+            if parsed.username != "git" or parsed.password is not None:
+                return None
+        else:
+            return None
+        parts = parsed.path.removeprefix("/").split("/")
+        if len(parts) == 2:
+            owner_repo = parts[0], parts[1]
+
+    if owner_repo is None:
+        return None
+    owner, repository = owner_repo
+    repository = repository.removesuffix(".git")
+    if (
+        unquote(owner) != owner
+        or unquote(repository) != repository
+        or not _GITHUB_COMPONENT.fullmatch(owner)
+        or not _GITHUB_COMPONENT.fullmatch(repository)
+    ):
+        return None
+    return f"https://github.com/{owner}/{repository}"
+
+
+def _content_kind_and_language(path: Path) -> tuple[Literal["markdown", "code", "text"], str]:
+    extension = path.suffix.lower()
+    if extension in _MARKDOWN_EXTENSIONS:
+        return "markdown", "markdown"
+    language = _CODE_LANGUAGES.get(extension)
+    if language is not None:
+        return "code", language
+    return "text", "text"
 
 
 @dataclass(frozen=True)
@@ -78,6 +160,51 @@ class DiscoveryResult:
     @property
     def relative_paths(self) -> tuple[str, ...]:
         return tuple(path.relative_to(self.root).as_posix() for path in self.sources)
+
+
+@dataclass(frozen=True)
+class RepositoryState:
+    """Resolved local repository identity used by source records."""
+
+    root: Path
+    revision: str
+    ref: str
+    branch: str | None
+    dirty: bool
+
+
+@dataclass(frozen=True)
+class RepositoryDiscoveryResult:
+    """Policy-filtered repository paths and their resolved Git state."""
+
+    state: RepositoryState
+    sources: tuple[SourceDocument, ...]
+    rejected: tuple[RejectedSource, ...]
+    warnings: tuple[str, ...] = ()
+
+
+class RepositoryDiscoveryError(ValueError):
+    """Raised when Git cannot safely resolve repository state."""
+
+
+class RepositoryDirtyError(RepositoryDiscoveryError):
+    """Raised when apply is requested for an unapproved dirty worktree."""
+
+
+def _run_git(root: Path, arguments: list[str], *, ok_returncodes: tuple[int, ...] = (0,)) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+    except (OSError, UnicodeError) as error:
+        raise RepositoryDiscoveryError("unable to inspect repository") from error
+    if completed.returncode not in ok_returncodes:
+        raise RepositoryDiscoveryError("unable to inspect repository")
+    return completed.stdout.strip()
 
 
 def _matches(path: str, patterns: Iterable[str]) -> bool:
@@ -426,3 +553,105 @@ def discover_sources(
         accepted.append(path)
 
     return DiscoveryResult(root_path, tuple(accepted), tuple(rejected), tuple(warnings))
+
+
+def discover_repository(
+    root: str | Path,
+    policy: SourcePolicy | None = None,
+    *,
+    ref: str = "HEAD",
+    for_apply: bool = False,
+    allow_dirty: bool = False,
+) -> RepositoryDiscoveryResult:
+    """Discover approved paths and resolve the exact commit represented by *ref*."""
+
+    root_path = Path(root).expanduser().resolve(strict=True)
+    top_level = Path(_run_git(root_path, ["rev-parse", "--show-toplevel"])).resolve(strict=True)
+    if top_level != root_path:
+        raise RepositoryDiscoveryError("repository root must be the Git top level")
+    revision = _run_git(
+        root_path,
+        ["rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
+    )
+    head_revision = _run_git(
+        root_path,
+        ["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
+    )
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
+        raise RepositoryDiscoveryError("Git did not return a valid commit identifier")
+    if revision != head_revision:
+        raise RepositoryDiscoveryError("selected ref must match the checked-out commit")
+    branch = (
+        _run_git(
+            root_path,
+            ["symbolic-ref", "--quiet", "--short", "HEAD"],
+            ok_returncodes=(0, 1),
+        )
+        or None
+    )
+    dirty = bool(_run_git(root_path, ["status", "--porcelain=v1", "--untracked-files=all", "--"]))
+    if for_apply and dirty and not allow_dirty:
+        raise RepositoryDirtyError("apply requires a clean worktree unless allow_dirty is set")
+    discovered = discover_sources(root_path, policy, for_apply=for_apply, repository=True)
+    remote = normalize_github_remote(
+        _run_git(
+            root_path,
+            ["config", "--get", "remote.origin.url"],
+            ok_returncodes=(0, 1),
+        )
+    )
+    source_revision = f"{revision}-dirty" if dirty else revision
+    corpus_root = remote or root_path.as_uri()
+    corpus_id = make_corpus_id("git", corpus_root)
+    documents: list[SourceDocument] = []
+    rejected = list(discovered.rejected)
+    for path in discovered.sources:
+        relative_path = path.relative_to(root_path).as_posix()
+        if path.is_symlink():
+            rejected.append(RejectedSource(relative_path, "repository_symlink"))
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            rejected.append(RejectedSource(relative_path, "detection_error"))
+            continue
+        content_kind, language = _content_kind_and_language(path)
+        source_uri = path.resolve().as_uri()
+        if remote is not None and not dirty:
+            source_uri = f"{remote}/blob/{revision}/{quote(relative_path, safe='/')}"
+        documents.append(
+            SourceDocument(
+                source_id=make_source_id(corpus_id, relative_path),
+                corpus_id=corpus_id,
+                source_kind="git",
+                content_kind=content_kind,
+                root=root_path,
+                path=path,
+                relative_path=relative_path,
+                source_uri=source_uri,
+                revision=source_revision,
+                content_hash=sha256_text(text),
+                text=text,
+                metadata={
+                    "language": language,
+                    "revision": source_revision,
+                    "branch": branch,
+                    "ref": ref,
+                    "remote_url": remote,
+                    "relative_path": relative_path,
+                },
+            )
+        )
+    state = RepositoryState(
+        root=root_path,
+        revision=revision,
+        ref=ref,
+        branch=branch,
+        dirty=dirty,
+    )
+    return RepositoryDiscoveryResult(
+        state=state,
+        sources=tuple(documents),
+        rejected=tuple(sorted(rejected, key=lambda item: item.path)),
+        warnings=discovered.warnings,
+    )
