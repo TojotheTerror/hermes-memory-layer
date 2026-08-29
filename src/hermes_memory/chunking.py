@@ -73,8 +73,12 @@ def _unit(lines: list[str], start: int, end: int, heading_path: tuple[str, ...])
     )
 
 
+def _token_estimate_for_length(length: int) -> int:
+    return max(1, ceil(length / 4))
+
+
 def _token_estimate(text: str) -> int:
-    return max(1, ceil(len(text) / 4))
+    return _token_estimate_for_length(len(text))
 
 
 def _pack(units: list[AtomicUnit]) -> AtomicUnit:
@@ -114,11 +118,23 @@ def _hard_split(unit: AtomicUnit, max_tokens: int) -> list[AtomicUnit]:
     max_characters = max_tokens * 4
     line_break_ends = _line_break_ends(unit.text)
     pieces: list[AtomicUnit] = []
+    start_boundary_index = 0
+    end_boundary_index = 0
     for start in range(0, len(unit.text), max_characters):
         end = min(start + max_characters, len(unit.text))
         text = unit.text[start:end]
-        start_line = unit.start_line + sum(boundary <= start for boundary in line_break_ends)
-        end_line = unit.start_line + sum(boundary <= end - 1 for boundary in line_break_ends)
+        while (
+            start_boundary_index < len(line_break_ends)
+            and line_break_ends[start_boundary_index] <= start
+        ):
+            start_boundary_index += 1
+        while (
+            end_boundary_index < len(line_break_ends)
+            and line_break_ends[end_boundary_index] <= end - 1
+        ):
+            end_boundary_index += 1
+        start_line = unit.start_line + start_boundary_index
+        end_line = unit.start_line + end_boundary_index
         pieces.append(
             AtomicUnit(
                 text=text,
@@ -143,39 +159,51 @@ def _pack_section(
         pieces = _hard_split(unit, max_tokens)
         expanded.extend((piece, len(pieces) == 1) for piece in pieces)
 
-    if _token_estimate("".join(item.text for item, _ in expanded)) <= max_tokens:
+    expanded_characters = sum(len(item.text) for item, _ in expanded)
+    if _token_estimate_for_length(expanded_characters) <= max_tokens:
         return [_pack([item for item, _ in expanded])]
 
-    groups: list[list[tuple[AtomicUnit, bool]]] = []
+    groups: list[tuple[list[tuple[AtomicUnit, bool]], int]] = []
     current: list[tuple[AtomicUnit, bool]] = []
+    current_characters = 0
     for item in expanded:
-        candidate = "".join(unit.text for unit, _ in [*current, item])
-        if current and _token_estimate(candidate) > max_tokens:
-            groups.append(current)
+        item_characters = len(item[0].text)
+        if current and (
+            _token_estimate_for_length(current_characters + item_characters) > max_tokens
+        ):
+            groups.append((current, current_characters))
             current = []
+            current_characters = 0
         current.append(item)
-        if _token_estimate("".join(unit.text for unit, _ in current)) >= target_tokens:
-            groups.append(current)
+        current_characters += item_characters
+        if _token_estimate_for_length(current_characters) >= target_tokens:
+            groups.append((current, current_characters))
             current = []
+            current_characters = 0
     if current:
-        groups.append(current)
+        groups.append((current, current_characters))
 
     packed: list[AtomicUnit] = []
-    for index, group in enumerate(groups):
+    for index, (group, group_characters) in enumerate(groups):
         overlap: list[tuple[AtomicUnit, bool]] = []
         if index:
-            for item in reversed(groups[index - 1]):
+            previous_group = groups[index - 1][0]
+            overlap_start = len(previous_group)
+            overlap_characters = 0
+            for previous_index in range(len(previous_group) - 1, -1, -1):
+                item = previous_group[previous_index]
                 if not item[1]:
                     break
-                candidate_overlap = [item, *overlap]
-                overlap_text = "".join(unit.text for unit, _ in candidate_overlap)
-                chunk_text = overlap_text + "".join(unit.text for unit, _ in group)
+                candidate_overlap_characters = overlap_characters + len(item[0].text)
                 if (
-                    _token_estimate(overlap_text) > overlap_tokens
-                    or _token_estimate(chunk_text) > max_tokens
+                    _token_estimate_for_length(candidate_overlap_characters) > overlap_tokens
+                    or _token_estimate_for_length(candidate_overlap_characters + group_characters)
+                    > max_tokens
                 ):
                     break
-                overlap = candidate_overlap
+                overlap_start = previous_index
+                overlap_characters = candidate_overlap_characters
+            overlap = previous_group[overlap_start:]
         packed.append(_pack([item for item, _ in [*overlap, *group]]))
     return packed
 
