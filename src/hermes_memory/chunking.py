@@ -109,7 +109,9 @@ def _python_symbol_start(
     return start
 
 
-def _generic_code_windows(text: str, *, max_tokens: int, max_lines: int) -> list[AtomicUnit]:
+def _generic_code_windows(
+    text: str, *, max_tokens: int, max_lines: int, start_line: int = 1
+) -> list[AtomicUnit]:
     """Split source deterministically while preserving every source character."""
     max_characters = max_tokens * 4
     windows: list[AtomicUnit] = []
@@ -131,7 +133,7 @@ def _generic_code_windows(text: str, *, max_tokens: int, max_lines: int) -> list
         current_end = 0
         current_characters = 0
 
-    for line_number, line in enumerate(_split_markdown_lines(text), start=1):
+    for line_number, line in enumerate(_split_markdown_lines(text), start=start_line):
         offset = 0
         while offset < len(line):
             if current and line_number - current_start + 1 > max_lines:
@@ -171,27 +173,57 @@ def parse_code_units(
         return _generic_code_windows(text, max_tokens=max_tokens, max_lines=max_lines)
 
     lines = _split_markdown_lines(text)
+    normalized_text = text.replace("\r\n", "\n").replace("\r", "\n")
     try:
-        tree = ast.parse(text.replace("\r\n", "\n").replace("\r", "\n"))
+        tree = ast.parse(normalized_text)
+        compile(tree, "<code>", "exec")
     except SyntaxError:
         return _generic_code_windows(text, max_tokens=max_tokens, max_lines=max_lines)
-    units: list[AtomicUnit] = []
-    for node, path in _python_symbols(tree):
+    symbols = _python_symbols(tree)
+    if not symbols:
+        return _generic_code_windows(text, max_tokens=max_tokens, max_lines=max_lines)
+
+    owners: list[tuple[str, int] | None] = [None] * len(lines)
+    for node, path in symbols:
         start = _python_symbol_start(node, lines)
         end = node.end_lineno
         if end is None:  # pragma: no cover - populated by supported Python versions
             raise ValueError("Python AST node has no end line")
+        owner = (".".join(path), len(path))
+        for index in range(start, end):
+            current_owner = owners[index]
+            if current_owner is None or current_owner[1] < owner[1]:
+                owners[index] = owner
+
+    units: list[AtomicUnit] = []
+    start = 0
+    while start < len(lines):
+        owner = owners[start]
+        end = start + 1
+        while end < len(lines) and owners[end] == owner:
+            end += 1
         source = "".join(lines[start:end])
-        units.append(
-            AtomicUnit(
-                text=source,
-                heading_path=(),
-                symbol=".".join(path),
-                start_line=start + 1,
-                end_line=end,
-                token_estimate=_token_estimate(source),
+        if owner is None:
+            units.extend(
+                _generic_code_windows(
+                    source,
+                    max_tokens=max_tokens,
+                    max_lines=max_lines,
+                    start_line=start + 1,
+                )
             )
-        )
+        else:
+            units.append(
+                AtomicUnit(
+                    text=source,
+                    heading_path=(),
+                    symbol=owner[0],
+                    start_line=start + 1,
+                    end_line=end,
+                    token_estimate=_token_estimate(source),
+                )
+            )
+        start = end
     return units
 
 

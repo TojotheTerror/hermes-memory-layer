@@ -11,6 +11,58 @@ def test_code_parser_accepts_positional_language_with_a_bounded_line_default():
     assert [(unit.symbol, unit.start_line, unit.end_line) for unit in units] == [("ready", 1, 2)]
 
 
+def test_valid_python_without_symbols_preserves_all_source_in_bounded_generic_units():
+    source = '"""Module 雪."""\r\n\r\nimport os\r\nVALUE = "café"\r\n# trailing comment\r\n'
+
+    first = parse_code_units(source, language="python", max_tokens=8, max_lines=2)
+    second = parse_code_units(source, language="python", max_tokens=8, max_lines=2)
+
+    assert first == second
+    assert "".join(unit.text for unit in first) == source
+    assert all(unit.symbol is None and unit.heading_path == () for unit in first)
+    assert all(unit.token_estimate <= 8 for unit in first)
+    assert all(unit.end_line - unit.start_line + 1 <= 2 for unit in first)
+
+
+def test_python_symbols_and_generic_gaps_partition_mixed_source_in_order():
+    source = (
+        '"""Module documentation."""\n'
+        "import os\n"
+        "\n"
+        "# outer comment\n"
+        "@decorate\n"
+        "class Outer:\n"
+        "    # method comment\n"
+        "    def café(self):\n"
+        "        return '雪'\n"
+        "    tail = True\n"
+        "\n"
+        "BETWEEN = 1\n"
+        "\n"
+        "# finish comment\n"
+        "async def finish():\n"
+        "    return os.name\n"
+        "\n"
+        "finish()\n"
+    )
+    lines = source.splitlines(keepends=True)
+
+    first = parse_code_units(source, language="python", max_tokens=100, max_lines=100)
+    second = parse_code_units(source, language="python", max_tokens=100, max_lines=100)
+
+    assert first == second
+    assert "".join(unit.text for unit in first) == source
+    assert [(unit.symbol, unit.start_line, unit.end_line, unit.text) for unit in first] == [
+        (None, 1, 3, "".join(lines[0:3])),
+        ("Outer", 4, 6, "".join(lines[3:6])),
+        ("Outer.café", 7, 9, "".join(lines[6:9])),
+        ("Outer", 10, 10, lines[9]),
+        (None, 11, 13, "".join(lines[10:13])),
+        ("finish", 14, 16, "".join(lines[13:16])),
+        (None, 17, 18, "".join(lines[16:18])),
+    ]
+
+
 def test_python_symbols_have_source_order_paths_and_inclusive_ranges():
     source = (
         "class Café:\n"
@@ -27,16 +79,15 @@ def test_python_symbols_have_source_order_paths_and_inclusive_ranges():
     second = parse_code_units(source, language="python", max_tokens=100, max_lines=100)
 
     assert first == second
+    lines = source.splitlines(keepends=True)
+    assert "".join(unit.text for unit in first) == source
     assert [(unit.symbol, unit.start_line, unit.end_line, unit.text) for unit in first] == [
-        (
-            "Café",
-            1,
-            5,
-            source.splitlines(keepends=True)[0] + "".join(source.splitlines(keepends=True)[1:5]),
-        ),
-        ("Café.greet", 2, 5, "".join(source.splitlines(keepends=True)[1:5])),
-        ("Café.greet.wave", 3, 4, "".join(source.splitlines(keepends=True)[2:4])),
-        ("finish", 7, 8, "".join(source.splitlines(keepends=True)[6:8])),
+        ("Café", 1, 1, lines[0]),
+        ("Café.greet", 2, 2, lines[1]),
+        ("Café.greet.wave", 3, 4, "".join(lines[2:4])),
+        ("Café.greet", 5, 5, lines[4]),
+        (None, 6, 6, lines[5]),
+        ("finish", 7, 8, "".join(lines[6:8])),
     ]
     assert all(unit.heading_path == () for unit in first)
     with pytest.raises(FrozenInstanceError):
@@ -86,6 +137,20 @@ def test_invalid_python_falls_back_to_bounded_windows_without_losing_source():
     assert "".join(unit.text for unit in first) == source
     assert all(unit.symbol is None and unit.heading_path == () for unit in first)
     assert all(unit.token_estimate <= 3 for unit in first)
+    assert all(unit.end_line - unit.start_line + 1 <= 2 for unit in first)
+
+
+@pytest.mark.parametrize("statement", ["return", "break", "continue", "yield 1"])
+def test_context_invalid_python_uses_complete_generic_fallback(statement: str):
+    source = f"def valid():\r\n    return '雪'\r\n{statement}\r\n"
+
+    first = parse_code_units(source, language="python", max_tokens=6, max_lines=2)
+    second = parse_code_units(source, language="python", max_tokens=6, max_lines=2)
+
+    assert first == second
+    assert "".join(unit.text for unit in first) == source
+    assert all(unit.symbol is None and unit.heading_path == () for unit in first)
+    assert all(unit.token_estimate <= 6 for unit in first)
     assert all(unit.end_line - unit.start_line + 1 <= 2 for unit in first)
 
 
