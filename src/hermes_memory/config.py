@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 
+_DOCUMENT_OVERRIDE_MISSING = object()
+
+
 @dataclass(frozen=True)
 class HermesMemoryConfig:
     project: str
@@ -28,8 +31,28 @@ class HermesMemoryConfig:
     ttl_days: int = 365
 
     def __post_init__(self) -> None:
-        if self.document_embedding_dimensions <= 0:
-            raise ValueError("document_embedding_dimensions must be greater than zero")
+        integer_settings = (
+            "document_embedding_dimensions",
+            "chunk_min_tokens",
+            "chunk_target_tokens",
+            "chunk_max_tokens",
+            "chunk_overlap_tokens",
+            "embedding_concurrency",
+            "document_top_k",
+            "document_context_char_limit",
+        )
+        for setting in integer_settings:
+            if type(getattr(self, setting)) is not int:
+                raise TypeError(f"{setting} must be an integer")
+
+        positive_settings = tuple(
+            setting for setting in integer_settings if setting != "chunk_overlap_tokens"
+        )
+        for setting in positive_settings:
+            if getattr(self, setting) <= 0:
+                raise ValueError(f"{setting} must be greater than zero")
+        if self.chunk_overlap_tokens < 0:
+            raise ValueError("chunk_overlap_tokens must be non-negative")
         if self.chunk_min_tokens > self.chunk_target_tokens:
             raise ValueError("chunk_min_tokens must be less than or equal to chunk_target_tokens")
         if self.chunk_target_tokens > self.chunk_max_tokens:
@@ -52,14 +75,17 @@ class HermesMemoryConfig:
         return f"projects/{self.project}/locations/{self.location}/reasoningEngines/{self.agent_engine_id}"
 
 
+def _load_document_setting(overrides, setting, environment, default):
+    override = overrides.get(setting, _DOCUMENT_OVERRIDE_MISSING)
+    if override is not _DOCUMENT_OVERRIDE_MISSING:
+        if override is None or override == "":
+            raise ValueError(f"{setting} must not be None or empty")
+        return override
+    return os.environ.get(environment) or default
+
+
 def _load_document_int(overrides, setting, environment, default):
-    override = overrides.get(setting)
-    value = (
-        override
-        if override is not None and override != ""
-        else os.environ.get(environment) or default
-    )
-    return int(value)
+    return int(_load_document_setting(overrides, setting, environment, default))
 
 
 def load_config(**overrides) -> HermesMemoryConfig:
@@ -82,9 +108,12 @@ def load_config(**overrides) -> HermesMemoryConfig:
         embedding_model=overrides.get("embedding_model")
         or os.environ.get("MEMORY_EMBEDDING_MODEL")
         or "text-embedding-005",
-        document_embedding_model=overrides.get("document_embedding_model")
-        or os.environ.get("DOCUMENT_EMBEDDING_MODEL")
-        or "gemini-embedding-001",
+        document_embedding_model=_load_document_setting(
+            overrides,
+            "document_embedding_model",
+            "DOCUMENT_EMBEDDING_MODEL",
+            "gemini-embedding-001",
+        ),
         document_embedding_dimensions=_load_document_int(
             overrides, "document_embedding_dimensions", "DOCUMENT_EMBEDDING_DIMENSIONS", 768
         ),
