@@ -202,6 +202,42 @@ class _FakeBigQueryClient:
         return _FakeJob()
 
 
+@pytest.mark.parametrize("dataset_id", ["123dataset", "7", "a" * 1024])
+def test_ensure_tables_accepts_valid_dataset_identifiers(monkeypatch, dataset_id):
+    client = _FakeBigQueryClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset=dataset_id)
+
+    bigquery_store.ensure_tables(cfg)
+
+    assert client.queries
+    assert all(f"`test-project.{dataset_id}." in sql for sql in client.queries)
+
+
+@pytest.mark.parametrize(
+    "dataset_id",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("a" * 1025, id="too-long"),
+        pytest.param("invalid-dataset", id="punctuation"),
+        pytest.param("test dataset", id="whitespace"),
+        pytest.param("project.dataset", id="qualification"),
+        pytest.param("test_dataset/*comment*/", id="comment"),
+        pytest.param("`test_dataset`", id="backticks"),
+        pytest.param("test_dataset;", id="semicolon"),
+    ],
+)
+def test_ensure_tables_rejects_invalid_dataset_identifiers_before_query(monkeypatch, dataset_id):
+    client = _FakeBigQueryClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset=dataset_id)
+
+    with pytest.raises(ValueError, match=r"Invalid BigQuery bq_dataset"):
+        bigquery_store.ensure_tables(cfg)
+
+    assert client.queries == []
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
