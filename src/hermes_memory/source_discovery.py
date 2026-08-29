@@ -32,6 +32,7 @@ COMMON_LOCK_FILE_NAMES = frozenset(
         "pnpm-lock.yaml",
         "bun.lock",
         "bun.lockb",
+        "go.sum",
     }
 )
 
@@ -106,8 +107,15 @@ def _git_ignore_status(
     return "error"
 
 
+def _filename_tokens(name: str) -> tuple[str, ...]:
+    camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "-", name)
+    camel_split = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "-", camel_split)
+    return tuple(token.lower() for token in re.split(r"[^A-Za-z0-9]+", camel_split) if token)
+
+
 def _is_secret_path(relative_path: str) -> bool:
-    name = Path(relative_path).name.lower()
+    raw_name = Path(relative_path).name
+    name = raw_name.lower()
     if name.startswith(".env"):
         return True
     if name in {
@@ -125,26 +133,27 @@ def _is_secret_path(relative_path: str) -> bool:
         return True
     if re.fullmatch(r"ssh_host_(?:rsa|dsa|ecdsa|ed25519)_key", name):
         return True
-    if Path(name).suffix in {".key", ".pem", ".p12", ".pfx"}:
+    if Path(name).suffix in {".key", ".pem", ".p12", ".pfx", ".ppk"}:
         return True
     if name in {"auth.json", "session.json", "token.json", "tokens.json"}:
         return True
-    markers = (
-        "credential",
-        "service-account",
-        "service_account",
-        "auth-token",
-        "auth_token",
-        "access-token",
-        "access_token",
-        "token-dump",
-        "token_dump",
-        "config-export",
-        "config_export",
-        "configuration-export",
-        "configuration_export",
-    )
-    return any(marker in name for marker in markers)
+
+    tokens = _filename_tokens(raw_name)
+    if any(token in {"credential", "credentials"} for token in tokens):
+        return True
+    sensitive_pairs = {
+        ("service", "account"),
+        ("auth", "token"),
+        ("access", "token"),
+        ("refresh", "token"),
+        ("client", "auth"),
+        ("client", "secret"),
+        ("browser", "session"),
+        ("token", "dump"),
+        ("config", "export"),
+        ("configuration", "export"),
+    }
+    return any(pair in sensitive_pairs for pair in zip(tokens, tokens[1:]))
 
 
 def _path_category_rule(relative_path: str) -> str | None:
@@ -152,7 +161,14 @@ def _path_category_rule(relative_path: str) -> str | None:
     name = path.name.lower()
     directories = tuple(part.lower().replace("_", "-") for part in path.parts[:-1])
 
-    if "generated" in directories or name.startswith("generated.") or ".generated." in name:
+    generated_stem = Path(name).stem
+    if (
+        "generated" in directories
+        or name.startswith("generated.")
+        or ".generated." in name
+        or generated_stem.endswith(("_generated", "-generated"))
+        or name.endswith(".pb.go")
+    ):
         return "generated_file"
     if name.endswith(".lock") or name in COMMON_LOCK_FILE_NAMES:
         return "lock_file"
@@ -160,17 +176,24 @@ def _path_category_rule(relative_path: str) -> str | None:
         return "secret_path"
 
     top = directories[0] if directories else ""
-    if top in {"private", "client", "clients"} or any(
-        part in {"client-corpus", "client-corpora", "private-corpus", "private-corpora"}
-        for part in directories
+    source_tree_roots = {"src", "source", "lib", "app", "packages", "tests", "test"}
+    private_categories = {
+        "private",
+        "clients",
+        "client-corpus",
+        "client-corpora",
+        "private-corpus",
+        "private-corpora",
+    }
+    legitimate_client_source = top in source_tree_roots and "client" in directories
+    if any(part in private_categories for part in directories) or (
+        "client" in directories and not legitimate_client_source
     ):
         return "private_corpus_path"
 
-    if top in PERSONAL_PATH_CATEGORIES or (
-        top == "personal"
-        and len(directories) > 1
-        and directories[1] in PERSONAL_PATH_CATEGORIES
-    ) or any(
+    sensitive_segments = PERSONAL_PATH_CATEGORIES.intersection(directories)
+    legitimate_identity_source = sensitive_segments == {"identity"} and top in source_tree_roots
+    if (sensitive_segments and not legitimate_identity_source) or any(
         part.startswith("personal-")
         and part.removeprefix("personal-") in PERSONAL_PATH_CATEGORIES
         for part in directories
@@ -178,9 +201,20 @@ def _path_category_rule(relative_path: str) -> str | None:
         return "sensitive_personal_path"
 
     raw_categories = {"raw-chat", "raw-chats", "raw-transcript", "raw-transcripts"}
-    if any(part in raw_categories for part in directories) or any(
-        left == "raw" and right in {"chat", "chats", "transcript", "transcripts"}
-        for left, right in zip(directories, directories[1:])
+    transcript_tokens = _filename_tokens(path.stem)
+    transcript_names = {"transcript", "transcripts", "conversation", "conversations"}
+    raw_export_suffixes = {".json", ".jsonl", ".ndjson", ".csv", ".txt", ".sqlite", ".db"}
+    raw_export_name = path.suffix.lower() in raw_export_suffixes and (
+        (len(transcript_tokens) == 1 and transcript_tokens[0] in transcript_names)
+        or {"chat", "transcript"}.issubset(transcript_tokens)
+    )
+    if (
+        any(part in raw_categories for part in directories)
+        or any(
+            left == "raw" and right in {"chat", "chats", "transcript", "transcripts"}
+            for left, right in zip(directories, directories[1:])
+        )
+        or raw_export_name
     ):
         return "raw_transcript_path"
     return None
@@ -197,8 +231,14 @@ def _looks_binary(content: bytes) -> bool:
 
 
 def _secret_content_rule(content: bytes) -> str | None:
-    if re.search(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", content, re.IGNORECASE):
+    private_key_header = re.compile(
+        rb"(?:-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|^PuTTY-User-Key-File-[23]:)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if private_key_header.search(content):
         return "private_key_header"
+    if re.search(rb'"type"\s*:\s*"service_account"', content):
+        return "service_account_json"
     token_assignment = re.compile(
         rb"^[ \t]*(?:export[ \t]+)?[\"']?"
         rb"(?:api[_-]?key|(?:api|access|auth|refresh)?[_-]?token|client[_-]?secret|password)"
@@ -207,6 +247,17 @@ def _secret_content_rule(content: bytes) -> str | None:
     )
     if token_assignment.search(content):
         return "token_assignment"
+    return None
+
+
+def _generated_content_rule(content: bytes) -> str | None:
+    header = content[:8192]
+    if re.search(
+        rb"(?:@generated\b|\bcode generated\b[^\r\n]*\bdo not edit\b)",
+        header,
+        re.IGNORECASE,
+    ):
+        return "generated_file"
     return None
 
 
@@ -288,6 +339,8 @@ def discover_sources(
                 rejected.append(RejectedSource(relative_path, "binary_content"))
                 continue
             secret_rule = _secret_content_rule(content)
+            if secret_rule is None:
+                secret_rule = _generated_content_rule(content)
         except Exception:
             rejected.append(RejectedSource(relative_path, "detection_error"))
             continue
