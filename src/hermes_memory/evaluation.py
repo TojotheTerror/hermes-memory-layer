@@ -67,28 +67,30 @@ class SearchHit:
 _LINE_RANGE = r"#L(?P<start>[1-9][0-9]*)(?:-L(?P<end>[1-9][0-9]*))?"
 _LOCAL_CITATION = re.compile(rf"(?P<path>[^#]+){_LINE_RANGE}\Z")
 _GITHUB_CITATION = re.compile(
-    rf"https://github\.com/[^/#]+/[^/#]+/blob/[0-9a-fA-F]{{40}}/(?P<path>[^#]+){_LINE_RANGE}\Z"
+    rf"https://github\.com/[A-Za-z0-9][A-Za-z0-9._-]*/"
+    rf"[A-Za-z0-9][A-Za-z0-9._-]*/blob/"
+    rf"(?P<commit>[0-9a-fA-F]{{40}})/(?P<path>[^#]+){_LINE_RANGE}\Z"
 )
 
 
 def _safe_relative_path(path: str) -> bool:
-    candidate = Path(path)
-    return (
-        bool(path)
-        and "\\" not in path
-        and ":" not in path
-        and not candidate.is_absolute()
-        and ".." not in candidate.parts
-        and "." not in candidate.parts
-    )
+    return path in APPROVED_PILOT_SOURCE_PATHS
 
 
 def is_valid_citation(hit: SearchHit) -> bool:
     """Validate exact local or commit-pinned GitHub inclusive line citations."""
-    match = _GITHUB_CITATION.fullmatch(hit.citation) or _LOCAL_CITATION.fullmatch(hit.citation)
+    github_match = _GITHUB_CITATION.fullmatch(hit.citation)
+    match = github_match or _LOCAL_CITATION.fullmatch(hit.citation)
     if match is None:
         return False
     path = match.group("path")
+    if (
+        path not in APPROVED_PILOT_SOURCE_PATHS
+        or hit.source_path not in APPROVED_PILOT_SOURCE_PATHS
+    ):
+        return False
+    if github_match is not None and int(github_match.group("commit"), 16) == 0:
+        return False
     end = match.group("end")
     cited_start = int(match.group("start"))
     cited_end = cited_start if end is None else int(end)
@@ -229,10 +231,17 @@ def write_report_json(report: EvaluationReport, path: str | Path) -> None:
             delete=False,
         ) as temporary:
             temporary_path = Path(temporary.name)
+            os.fchmod(temporary.fileno(), 0o600)
             temporary.write(payload)
             temporary.flush()
             os.fsync(temporary.fileno())
         os.replace(temporary_path, output_path)
+        temporary_path = None
+        directory_fd = os.open(output_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except Exception:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
@@ -254,11 +263,14 @@ def _deduplicate_and_rank(hits: Sequence[SearchHit]) -> tuple[SearchHit, ...]:
         ),
     )
     unique: list[SearchHit] = []
-    seen_chunk_ids: set[str] = set()
+    seen_by_chunk_id: dict[str, SearchHit] = {}
     for hit in ordered:
-        if hit.chunk_id not in seen_chunk_ids:
+        previous = seen_by_chunk_id.get(hit.chunk_id)
+        if previous is None:
             unique.append(hit)
-            seen_chunk_ids.add(hit.chunk_id)
+            seen_by_chunk_id[hit.chunk_id] = hit
+        elif hit != previous:
+            raise ValueError(f"conflicting duplicate chunk id: {hit.chunk_id}")
     return tuple(unique)
 
 
@@ -514,7 +526,11 @@ def load_queries(path: str | Path) -> tuple[EvaluationQuery, ...]:
         raise ValueError(f"invalid query fixture {fixture_path}: {exc}") from exc
     if not isinstance(document, dict) or any(type(key) is not str for key in document):
         raise ValueError("query fixture must be an object with version 1")
-    if frozenset(document) != {"version", "queries"} or document["version"] != 1:
+    if (
+        frozenset(document) != {"version", "queries"}
+        or type(document["version"]) is not int
+        or document["version"] != 1
+    ):
         raise ValueError("query fixture must contain only version 1 and queries")
     rows = document["queries"]
     if not isinstance(rows, list) or not rows:

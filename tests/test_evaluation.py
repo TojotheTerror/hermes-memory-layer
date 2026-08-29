@@ -196,6 +196,26 @@ def test_load_queries_rejects_conflicting_duplicate_field_definitions(tmp_path):
         load_queries(fixture)
 
 
+def test_load_queries_requires_exact_builtin_integer_version_one(tmp_path):
+    import json
+
+    import pytest
+
+    from hermes_memory.evaluation import load_queries
+
+    query = {
+        "id": "version-check",
+        "query": "Which version is accepted?",
+        "expected_source_path": "README.md",
+    }
+    for index, invalid_version in enumerate((True, 1.0)):
+        fixture = tmp_path / f"invalid-version-{index}.yaml"
+        fixture.write_text(json.dumps({"version": invalid_version, "queries": [query]}))
+
+        with pytest.raises(ValueError, match="version 1"):
+            load_queries(fixture)
+
+
 def test_search_hit_rejects_non_string_heading_path_values():
     from typing import Any, cast
 
@@ -312,6 +332,104 @@ def test_citation_validation_requires_l_prefix_on_both_range_endpoints():
 
     assert is_valid_citation(local) is False
     assert is_valid_citation(github) is False
+
+
+def test_citation_validation_rejects_noncanonical_unapproved_and_zero_commit_inputs():
+    from hermes_memory.evaluation import SearchHit, is_valid_citation
+
+    unsafe_paths = (
+        "Secrets/private.md",
+        "Operations/../README.md",
+        "Operations/%2e%2e/README.md",
+        "Operations/%2E%2E/README.md",
+        "README.md\x00",
+        "README.md\n",
+        "README.md\t",
+        "README\u202e.md",
+    )
+    unsafe_hits = tuple(
+        SearchHit(
+            chunk_id=f"unsafe-{index}",
+            source_path=path,
+            heading_path=(),
+            symbol=None,
+            start_line=1,
+            end_line=1,
+            citation=f"{path}#L1",
+            distance=0.1,
+        )
+        for index, path in enumerate(unsafe_paths)
+    )
+    zero_commit = SearchHit(
+        chunk_id="zero-commit",
+        source_path="main.go",
+        heading_path=(),
+        symbol=None,
+        start_line=1,
+        end_line=1,
+        citation=(
+            "https://github.com/example/not-resolved/blob/"
+            "0000000000000000000000000000000000000000/main.go#L1"
+        ),
+        distance=0.1,
+    )
+    synthetic_nonzero_commit = SearchHit(
+        **{
+            **zero_commit.__dict__,
+            "chunk_id": "synthetic-nonzero-commit",
+            "citation": zero_commit.citation.replace("0" * 40, "1" * 40),
+        }
+    )
+    bidi_url = SearchHit(
+        **{
+            **synthetic_nonzero_commit.__dict__,
+            "chunk_id": "bidi-url",
+            "citation": synthetic_nonzero_commit.citation.replace("example", "exam\u202eple"),
+        }
+    )
+
+    assert [is_valid_citation(hit) for hit in unsafe_hits] == [False] * len(unsafe_hits)
+    assert is_valid_citation(zero_commit) is False
+    assert is_valid_citation(bidi_url) is False
+    assert is_valid_citation(synthetic_nonzero_commit) is True
+
+
+def test_evaluator_rejects_conflicting_duplicate_chunk_ids():
+    import pytest
+
+    from hermes_memory.evaluation import (
+        EvaluationQuery,
+        SearchHit,
+        SearchResponse,
+        evaluate_queries,
+    )
+
+    original = SearchHit(
+        chunk_id="shared-id",
+        source_path="main.go",
+        heading_path=(),
+        symbol="NewStore",
+        start_line=25,
+        end_line=28,
+        citation="main.go#L25-L28",
+        distance=0.1,
+    )
+    conflicting = SearchHit(
+        **{
+            **original.__dict__,
+            "source_path": "README.md",
+            "symbol": None,
+            "start_line": 3,
+            "end_line": 3,
+            "citation": "README.md#L3",
+        }
+    )
+
+    with pytest.raises(ValueError, match="conflicting duplicate chunk id"):
+        evaluate_queries(
+            (EvaluationQuery("constructor", "Constructor?", "main.go"),),
+            lambda query: SearchResponse(hits=(original, conflicting)),
+        )
 
 
 def test_evaluator_computes_deterministic_metrics_deduplicates_hits_and_passes_pilot_gates():
@@ -725,6 +843,72 @@ def test_evaluate_docs_cli_writes_failed_gate_report_before_exiting_nonzero(monk
     assert report["pilot_gate"]["failed_metrics"] == ["recall_at_5", "citation_validity"]
 
 
+def test_write_report_json_is_durable_private_and_cleans_failed_temporary_files(
+    monkeypatch, tmp_path
+):
+    import stat
+
+    import pytest
+
+    from hermes_memory import evaluation
+
+    clock_values = iter((0.0, 0.1))
+    report = evaluation.evaluate_queries(
+        (evaluation.EvaluationQuery("missing", "Missing?", "README.md"),),
+        lambda query: evaluation.SearchResponse(),
+        clock=clock_values.__next__,
+    )
+    output_path = tmp_path / "report.json"
+    events = []
+    directory_fds = set()
+    real_open = evaluation.os.open
+    real_fsync = evaluation.os.fsync
+    real_close = evaluation.os.close
+    real_replace = evaluation.os.replace
+
+    def recording_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if flags & evaluation.os.O_DIRECTORY:
+            directory_fds.add(descriptor)
+            events.append("open-parent")
+        return descriptor
+
+    def recording_fsync(descriptor):
+        if descriptor in directory_fds:
+            events.append("fsync-parent")
+        return real_fsync(descriptor)
+
+    def recording_close(descriptor):
+        if descriptor in directory_fds:
+            events.append("close-parent")
+        return real_close(descriptor)
+
+    def recording_replace(source, target):
+        real_replace(source, target)
+        events.append("replace")
+
+    monkeypatch.setattr(evaluation.os, "open", recording_open)
+    monkeypatch.setattr(evaluation.os, "fsync", recording_fsync)
+    monkeypatch.setattr(evaluation.os, "close", recording_close)
+    monkeypatch.setattr(evaluation.os, "replace", recording_replace)
+
+    evaluation.write_report_json(report, output_path)
+
+    assert events == ["replace", "open-parent", "fsync-parent", "close-parent"]
+    assert stat.S_IMODE(output_path.stat().st_mode) == 0o600
+
+    failed_output = tmp_path / "failed.json"
+    monkeypatch.setattr(
+        evaluation.os,
+        "replace",
+        lambda source, target: (_ for _ in ()).throw(OSError("replace failed")),
+    )
+    with pytest.raises(OSError, match="replace failed"):
+        evaluation.write_report_json(report, failed_output)
+    assert not failed_output.exists()
+    assert tuple(tmp_path.glob(".failed.json.*.tmp")) == ()
+
+
 def test_evaluate_docs_cli_rejects_malformed_fixture_without_touching_output(monkeypatch, tmp_path):
     from click.testing import CliRunner
 
@@ -747,8 +931,60 @@ def test_evaluate_docs_cli_rejects_malformed_fixture_without_touching_output(mon
     )
 
     assert result.exit_code != 0
-    assert "query fixture" in result.output
+    assert result.output == "Error: document evaluation failed\n"
+    assert "query fixture" not in result.output
     assert output_path.read_text() == "preserve-existing-output"
+
+
+def test_evaluate_docs_cli_maps_backend_exceptions_to_generic_click_errors(monkeypatch, tmp_path):
+    import json
+
+    from click.testing import CliRunner
+
+    from hermes_memory import evaluation
+    from hermes_memory.cli import main
+
+    class BackendFailure(Exception):
+        pass
+
+    queries_path = tmp_path / "queries.yaml"
+    queries_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "queries": [
+                    {
+                        "id": "backend-error",
+                        "query": "Will the backend fail?",
+                        "expected_source_path": "README.md",
+                    }
+                ],
+            }
+        )
+    )
+
+    def failing_factory():
+        raise BackendFailure("PRIVATE_FACTORY_DETAIL")
+
+    def failing_execute_factory():
+        def execute(query):
+            raise BackendFailure("PRIVATE_EVALUATION_DETAIL")
+
+        return execute
+
+    for index, factory in enumerate((failing_factory, failing_execute_factory)):
+        output_path = tmp_path / f"report-{index}.json"
+        monkeypatch.setattr(evaluation, "make_runtime_query_executor", factory)
+
+        result = CliRunner().invoke(
+            main,
+            ["evaluate-docs", "--queries", str(queries_path), "--json", str(output_path)],
+        )
+
+        assert result.exit_code != 0
+        assert result.output == "Error: document evaluation failed\n"
+        assert "PRIVATE_" not in result.output
+        assert not output_path.exists()
 
 
 def test_committed_pilot_fixture_has_ten_to_fifteen_approved_non_sensitive_queries():

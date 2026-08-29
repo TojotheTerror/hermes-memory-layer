@@ -58,8 +58,8 @@ def evaluate_docs(queries_path: Path, json_path: Path):
         execute_search = evaluation.make_runtime_query_executor()
         report = evaluation.evaluate_queries(queries, execute_search)
         evaluation.write_report_json(report, json_path)
-    except (OSError, RuntimeError, TypeError, ValueError) as exc:
-        raise click.ClickException(str(exc)) from exc
+    except Exception:
+        raise click.ClickException("document evaluation failed") from None
     if not report.pilot_gate.passed:
         raise click.exceptions.Exit(1)
 
