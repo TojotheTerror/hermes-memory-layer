@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
+import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 from typing import Iterable, Literal
 
@@ -277,8 +279,9 @@ def _static_path_rule(relative_path: str, policy: SourcePolicy) -> str | None:
         return "not_in_allowlist"
     if _matches(relative_path, policy.exclude_patterns):
         return "exclude_pattern"
-    if relative_path == ".git" or any(
-        part.lower() in DEFAULT_EXCLUDED_DIRECTORIES for part in Path(relative_path).parts[:-1]
+    path_parts = Path(relative_path).parts
+    if any(part.lower() == ".git" for part in path_parts) or any(
+        part.lower() in DEFAULT_EXCLUDED_DIRECTORIES for part in path_parts[:-1]
     ):
         return "default_excluded_directory"
     return _path_category_rule(relative_path)
@@ -333,6 +336,62 @@ def _generated_content_rule(content: bytes) -> str | None:
     return None
 
 
+def _stable_bounded_read(
+    target: Path, expected_stat: os.stat_result, max_file_size_bytes: int
+) -> tuple[bytes | None, str | None]:
+    """Read an approved target bounded, with no-follow when available and identity checks."""
+
+    descriptor = -1
+    try:
+        if target.resolve(strict=True) != target:
+            return None, "detection_error"
+        path_stat = target.stat(follow_symlinks=False)
+        expected_identity = (expected_stat.st_dev, expected_stat.st_ino)
+        if (
+            stat.S_ISLNK(path_stat.st_mode)
+            or (path_stat.st_dev, path_stat.st_ino) != expected_identity
+        ):
+            return None, "detection_error"
+
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(target, flags)
+        descriptor_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(descriptor_stat.st_mode)
+            or (
+                descriptor_stat.st_dev,
+                descriptor_stat.st_ino,
+            )
+            != expected_identity
+        ):
+            return None, "detection_error"
+        if expected_stat.st_size > max_file_size_bytes:
+            return None, "max_file_size"
+
+        content_buffer = bytearray()
+        read_limit = max_file_size_bytes + 1
+        while len(content_buffer) < read_limit:
+            chunk = os.read(descriptor, read_limit - len(content_buffer))
+            if not chunk:
+                break
+            content_buffer.extend(chunk)
+        if len(content_buffer) > max_file_size_bytes:
+            return None, "max_file_size"
+        content = bytes(content_buffer)
+
+        final_path_stat = target.stat(follow_symlinks=False)
+        if (final_path_stat.st_dev, final_path_stat.st_ino) != expected_identity:
+            return None, "detection_error"
+        return content, None
+    except OSError:
+        return None, "detection_error"
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def discover_sources(
     root: str | Path,
     policy: SourcePolicy | None = None,
@@ -365,17 +424,18 @@ def discover_sources(
         if alias_path_rule:
             rejected.append(RejectedSource(relative_path, alias_path_rule))
             continue
-        target_relative_path = relative_path
-        if path.is_symlink():
-            try:
-                target = path.resolve(strict=True)
-            except OSError:
-                rejected.append(RejectedSource(relative_path, "detection_error"))
-                continue
-            if not target.is_relative_to(root_path):
-                rejected.append(RejectedSource(relative_path, "symlink_escape"))
-                continue
-            target_relative_path = target.relative_to(root_path).as_posix()
+        try:
+            is_symlink = path.is_symlink()
+            target = path.resolve(strict=True)
+            target_stat = target.stat(follow_symlinks=False)
+        except OSError:
+            rejected.append(RejectedSource(relative_path, "detection_error"))
+            continue
+        if not target.is_relative_to(root_path):
+            rejected.append(RejectedSource(relative_path, "symlink_escape"))
+            continue
+        target_relative_path = target.relative_to(root_path).as_posix()
+        if is_symlink:
             target_path_rule = _static_path_rule(target_relative_path, active_policy)
             if target_path_rule:
                 rejected.append(RejectedSource(relative_path, target_path_rule))
@@ -391,7 +451,7 @@ def discover_sources(
             elif git_status == "error":
                 rejected.append(RejectedSource(relative_path, "detection_error"))
                 continue
-            if path.is_symlink() and git_available:
+            if is_symlink and git_available:
                 target_git_status = _git_ignore_status(root_path, target_relative_path)
                 if target_git_status == "ignored":
                     rejected.append(RejectedSource(relative_path, "git_ignored"))
@@ -402,14 +462,13 @@ def discover_sources(
                 elif target_git_status == "error":
                     rejected.append(RejectedSource(relative_path, "detection_error"))
                     continue
-        try:
-            if path.stat().st_size > active_policy.max_file_size_bytes:
-                rejected.append(RejectedSource(relative_path, "max_file_size"))
-                continue
-            content = path.read_bytes()
-        except OSError:
-            rejected.append(RejectedSource(relative_path, "detection_error"))
+        content, read_rule = _stable_bounded_read(
+            target, target_stat, active_policy.max_file_size_bytes
+        )
+        if read_rule:
+            rejected.append(RejectedSource(relative_path, read_rule))
             continue
+        assert content is not None
         try:
             if _looks_binary(content):
                 rejected.append(RejectedSource(relative_path, "binary_content"))

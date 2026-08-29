@@ -173,6 +173,36 @@ def test_worktree_git_metadata_file_is_rejected_without_disclosure(
     }
 
 
+def test_nested_worktree_git_metadata_file_is_rejected_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metadata_body = b"gitdir: /outside/private/worktree-metadata\n"
+    _write(tmp_path, ".gitignore", b"*.tmp\n")
+    _write(tmp_path, "linked-worktree/.git", metadata_body)
+    _write(tmp_path, "linked-worktree/notes.md")
+    original_looks_binary = source_discovery._looks_binary
+    inspected: list[bytes] = []
+
+    def record_inspected_content(content: bytes) -> bool:
+        inspected.append(content)
+        return original_looks_binary(content)
+
+    monkeypatch.setattr(source_discovery, "_looks_binary", record_inspected_content)
+
+    result = discover_sources(tmp_path, SourcePolicy(include_patterns=("**",)))
+
+    assert result.relative_paths == (".gitignore", "linked-worktree/notes.md")
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("linked-worktree/.git", "default_excluded_directory"),
+    ]
+    assert metadata_body not in inspected
+    assert vars(result.rejected[0]) == {
+        "path": "linked-worktree/.git",
+        "rule": "default_excluded_directory",
+    }
+    assert metadata_body.decode().strip() not in repr(result)
+
+
 def test_symlink_that_escapes_root_is_rejected(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
@@ -281,6 +311,131 @@ def test_internal_symlink_is_allowed_when_alias_and_target_are_safe(tmp_path: Pa
     assert result.rejected == ()
 
 
+def test_internal_symlink_swap_after_target_policy_check_does_not_read_outside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    approved_content = b"approved internal content"
+    outside_content = b"outside body must never be inspected"
+    target = _write(root, "docs/original.md", approved_content)
+    alias = root / "docs/alias.md"
+    alias.symlink_to(target)
+    outside = _write(tmp_path, "outside.md", outside_content)
+    original_static_path_rule = source_discovery._static_path_rule
+    inspected: list[bytes] = []
+    swapped = False
+
+    def swap_after_target_policy_check(relative_path: str, policy: SourcePolicy) -> str | None:
+        nonlocal swapped
+        rule = original_static_path_rule(relative_path, policy)
+        if relative_path == "docs/original.md" and not swapped:
+            alias.unlink()
+            alias.symlink_to(outside)
+            swapped = True
+        return rule
+
+    original_secret_content_rule = source_discovery._secret_content_rule
+
+    def record_inspected_content(content: bytes) -> str | None:
+        inspected.append(content)
+        return original_secret_content_rule(content)
+
+    monkeypatch.setattr(source_discovery, "_static_path_rule", swap_after_target_policy_check)
+    monkeypatch.setattr(source_discovery, "_secret_content_rule", record_inspected_content)
+
+    result = discover_sources(root, SourcePolicy(include_patterns=("docs/**",)))
+
+    assert swapped
+    assert result.relative_paths == ("docs/alias.md", "docs/original.md")
+    assert outside_content not in inspected
+    assert inspected == [approved_content, approved_content]
+    assert result.rejected == ()
+    assert outside_content.decode() not in repr(result)
+
+
+def test_regular_file_parent_replaced_after_canonicalization_does_not_read_outside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    approved_directory = root / "docs"
+    target = _write(root, "docs/notes.md", b"approved internal content")
+    outside_directory = tmp_path / "outside"
+    outside_content = b"outside directory body must never be inspected"
+    _write(outside_directory, "notes.md", outside_content)
+    parked_directory = root / "parked-docs"
+    original_resolve = Path.resolve
+    inspected: list[bytes] = []
+    replaced = False
+
+    def replace_parent_after_canonicalization(path: Path, strict: bool = False) -> Path:
+        nonlocal replaced
+        resolved = original_resolve(path, strict=strict)
+        if path == target and not replaced:
+            approved_directory.rename(parked_directory)
+            approved_directory.symlink_to(outside_directory, target_is_directory=True)
+            replaced = True
+        return resolved
+
+    original_looks_binary = source_discovery._looks_binary
+
+    def record_inspected_content(content: bytes) -> bool:
+        inspected.append(content)
+        return original_looks_binary(content)
+
+    monkeypatch.setattr(Path, "resolve", replace_parent_after_canonicalization)
+    monkeypatch.setattr(source_discovery, "_looks_binary", record_inspected_content)
+
+    result = discover_sources(root, SourcePolicy(include_patterns=("docs/**",)))
+
+    assert replaced
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("docs/notes.md", "detection_error"),
+    ]
+    assert inspected == []
+    assert outside_content.decode() not in repr(result)
+
+
+def test_regular_file_replaced_by_outside_symlink_fails_closed_without_nofollow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "root"
+    target = _write(root, "docs/notes.md", b"approved internal content")
+    outside_content = b"outside replacement body must never be inspected"
+    outside = _write(tmp_path, "outside.md", outside_content)
+    original_open = source_discovery.os.open
+    inspected: list[bytes] = []
+    replaced = False
+
+    def replace_with_outside_symlink(path: Path, flags: int) -> int:
+        nonlocal replaced
+        if Path(path) == target and not replaced:
+            target.unlink()
+            target.symlink_to(outside)
+            replaced = True
+        return original_open(path, flags)
+
+    original_looks_binary = source_discovery._looks_binary
+
+    def record_inspected_content(content: bytes) -> bool:
+        inspected.append(content)
+        return original_looks_binary(content)
+
+    monkeypatch.delattr(source_discovery.os, "O_NOFOLLOW", raising=False)
+    monkeypatch.setattr(source_discovery.os, "open", replace_with_outside_symlink)
+    monkeypatch.setattr(source_discovery, "_looks_binary", record_inspected_content)
+
+    result = discover_sources(root, SourcePolicy(include_patterns=("docs/**",)))
+
+    assert replaced
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("docs/notes.md", "detection_error"),
+    ]
+    assert inspected == []
+    assert outside_content.decode() not in repr(result)
+
+
 def test_binary_file_is_rejected(tmp_path: Path) -> None:
     _write(tmp_path, "image.bin", b"text prefix\x00binary payload")
 
@@ -304,6 +459,46 @@ def test_file_larger_than_policy_limit_is_rejected(tmp_path: Path) -> None:
     assert [(item.path, item.rule) for item in result.rejected] == [
         ("large.md", "max_file_size"),
     ]
+
+
+def test_file_growth_after_handle_check_is_bounded_and_rejected_before_inspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _write(tmp_path, "growing.md", b"1234")
+    oversized_content = b"12345"
+    original_fstat = source_discovery.os.fstat
+    original_looks_binary = source_discovery._looks_binary
+    inspected: list[bytes] = []
+    grew = False
+
+    def grow_after_handle_check(descriptor: int) -> source_discovery.os.stat_result:
+        nonlocal grew
+        descriptor_stat = original_fstat(descriptor)
+        if not grew:
+            with target.open("ab") as stream:
+                stream.write(b"5")
+            grew = True
+        return descriptor_stat
+
+    def record_inspected_content(content: bytes) -> bool:
+        inspected.append(content)
+        return original_looks_binary(content)
+
+    monkeypatch.setattr(source_discovery.os, "fstat", grow_after_handle_check)
+    monkeypatch.setattr(source_discovery, "_looks_binary", record_inspected_content)
+
+    result = discover_sources(
+        tmp_path,
+        SourcePolicy(include_patterns=("**",), max_file_size_bytes=4),
+    )
+
+    assert grew
+    assert result.relative_paths == ()
+    assert [(item.path, item.rule) for item in result.rejected] == [
+        ("growing.md", "max_file_size"),
+    ]
+    assert inspected == []
+    assert oversized_content.decode() not in repr(result)
 
 
 @pytest.mark.parametrize(
