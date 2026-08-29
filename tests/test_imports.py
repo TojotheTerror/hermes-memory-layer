@@ -1,17 +1,28 @@
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
 def test_imports():
     import hermes_memory
+
     assert hermes_memory.__version__ == "0.1.0"
     from hermes_memory.config import load_config
+
     cfg = load_config()
     assert cfg.project
     assert cfg.bq_dataset == "hermes_memory"
     assert cfg.bq_location == "US"
 
+
 def test_config_paths():
     from hermes_memory.config import load_config
+
     cfg = load_config(project="test-proj", location="us-central1")
     assert "test-proj" in cfg.generation_model_path
     assert "gemini-2.5-flash" in cfg.generation_model_path
+
 
 def test_bigquery_ddl_present():
     from hermes_memory.bigquery_store import (
@@ -20,11 +31,39 @@ def test_bigquery_ddl_present():
         DDL_MEMORIES,
         DDL_SESSIONS,
     )
+
     assert "CREATE TABLE IF NOT EXISTS" in DDL_MEMORIES
     assert "embedding ARRAY<FLOAT64>" in DDL_MEMORIES
     assert "sessions" in DDL_SESSIONS
     assert "document_sources" in DDL_DOCUMENT_SOURCES
     assert "document_chunks" in DDL_DOCUMENT_CHUNKS
+
+
+def test_bigquery_store_import_does_not_construct_a_client():
+    root = Path(__file__).parents[1]
+    script = """
+from google.cloud import bigquery
+
+def fail_client_construction(*args, **kwargs):
+    raise AssertionError("BigQuery client constructed during import")
+
+bigquery.Client = fail_client_construction
+import hermes_memory.bigquery_store
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(root / "src")
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
 
 def test_bridge_mock_is_fully_isolated(monkeypatch):
     from hermes_memory.config import HermesMemoryConfig
