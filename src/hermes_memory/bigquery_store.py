@@ -54,6 +54,53 @@ DDL_REVISIONS = """CREATE TABLE IF NOT EXISTS `{project}.{dataset}.memory_revisi
 ) OPTIONS(description="Memory revision audit trail");
 """
 
+DDL_DOCUMENT_SOURCES = """CREATE TABLE IF NOT EXISTS `{project}.{dataset}.document_sources` (
+  source_id STRING NOT NULL,
+  corpus_id STRING NOT NULL,
+  user_id STRING NOT NULL,
+  agent_name STRING NOT NULL,
+  source_kind STRING NOT NULL,
+  content_kind STRING NOT NULL,
+  relative_path STRING NOT NULL,
+  source_uri STRING NOT NULL,
+  revision STRING NOT NULL,
+  content_hash STRING NOT NULL,
+  metadata JSON,
+  is_active BOOL NOT NULL,
+  first_seen_at TIMESTAMP NOT NULL,
+  last_seen_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP NOT NULL
+)
+CLUSTER BY user_id, agent_name, corpus_id, source_kind;
+"""
+
+DDL_DOCUMENT_CHUNKS = """CREATE TABLE IF NOT EXISTS `{project}.{dataset}.document_chunks` (
+  chunk_id STRING NOT NULL,
+  source_id STRING NOT NULL,
+  corpus_id STRING NOT NULL,
+  user_id STRING NOT NULL,
+  agent_name STRING NOT NULL,
+  ordinal INT64 NOT NULL,
+  content STRING NOT NULL,
+  contextual_content STRING NOT NULL,
+  content_hash STRING NOT NULL,
+  heading_path ARRAY<STRING>,
+  symbol STRING,
+  start_line INT64,
+  end_line INT64,
+  citation STRING NOT NULL,
+  embedding ARRAY<FLOAT64> NOT NULL,
+  embedding_model STRING NOT NULL,
+  embedding_task_type STRING NOT NULL,
+  embedding_dimensions INT64 NOT NULL,
+  metadata JSON,
+  is_active BOOL NOT NULL,
+  created_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP NOT NULL
+)
+CLUSTER BY user_id, agent_name, corpus_id, source_id;
+"""
+
 DDL_VIEWS = {
     "recent_memories": """CREATE OR REPLACE VIEW `{project}.{dataset}.recent_memories` AS
 SELECT memory_id, fact, JSON_VALUE(scope, '$.user_id') AS user_id, agent_name, created_at, expires_at
@@ -109,7 +156,14 @@ def ensure_tables(cfg: HermesMemoryConfig | None = None):
     if client is None:
         print("[mock] ensure_tables skipped")
         return
-    for name, ddl in [("memories", DDL_MEMORIES), ("sessions", DDL_SESSIONS), ("revisions", DDL_REVISIONS)]:
+    tables = [
+        ("memories", DDL_MEMORIES),
+        ("sessions", DDL_SESSIONS),
+        ("revisions", DDL_REVISIONS),
+        ("document_sources", DDL_DOCUMENT_SOURCES),
+        ("document_chunks", DDL_DOCUMENT_CHUNKS),
+    ]
+    for name, ddl in tables:
         sql = ddl.format(project=cfg.project, dataset=cfg.bq_dataset, bq_location=cfg.bq_location)
         client.query(sql).result()
         print(f"Table ready: {cfg.bq_dataset}.{name}")

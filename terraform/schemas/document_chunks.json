@@ -1,0 +1,26 @@
+{
+  "fields": [
+    {"name": "chunk_id", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "source_id", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "corpus_id", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "user_id", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "agent_name", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "ordinal", "type": "INT64", "mode": "REQUIRED"},
+    {"name": "content", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "contextual_content", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "content_hash", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "heading_path", "type": "STRING", "mode": "REPEATED"},
+    {"name": "symbol", "type": "STRING", "mode": "NULLABLE"},
+    {"name": "start_line", "type": "INT64", "mode": "NULLABLE"},
+    {"name": "end_line", "type": "INT64", "mode": "NULLABLE"},
+    {"name": "citation", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "embedding", "type": "FLOAT64", "mode": "REPEATED"},
+    {"name": "embedding_model", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "embedding_task_type", "type": "STRING", "mode": "REQUIRED"},
+    {"name": "embedding_dimensions", "type": "INT64", "mode": "REQUIRED"},
+    {"name": "metadata", "type": "JSON", "mode": "NULLABLE"},
+    {"name": "is_active", "type": "BOOL", "mode": "REQUIRED"},
+    {"name": "created_at", "type": "TIMESTAMP", "mode": "REQUIRED"},
+    {"name": "updated_at", "type": "TIMESTAMP", "mode": "REQUIRED"}
+  ]
+}
