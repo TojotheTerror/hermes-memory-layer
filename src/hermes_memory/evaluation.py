@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 APPROVED_PILOT_SOURCE_PATHS = frozenset(
     {
         "Operations/agent-memory.md",
@@ -49,7 +48,12 @@ class SearchHit:
     distance: float
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "heading_path", tuple(self.heading_path))
+        if isinstance(self.heading_path, (str, bytes)):
+            raise TypeError("hit heading path must be a sequence of strings")
+        heading_path = tuple(self.heading_path)
+        if any(type(value) is not str for value in heading_path):
+            raise TypeError("hit heading path must contain only strings")
+        object.__setattr__(self, "heading_path", heading_path)
         if type(self.start_line) is not int or type(self.end_line) is not int:
             raise TypeError("hit line numbers must be integers")
         if self.start_line < 1 or self.end_line < self.start_line:
@@ -60,7 +64,7 @@ class SearchHit:
             raise ValueError("hit identifiers, source path, and citation must be non-empty")
 
 
-_LINE_RANGE = r"#L(?P<start>[1-9][0-9]*)(?:-L?(?P<end>[1-9][0-9]*))?"
+_LINE_RANGE = r"#L(?P<start>[1-9][0-9]*)(?:-L(?P<end>[1-9][0-9]*))?"
 _LOCAL_CITATION = re.compile(rf"(?P<path>[^#]+){_LINE_RANGE}\Z")
 _GITHUB_CITATION = re.compile(
     rf"https://github\.com/[^/#]+/[^/#]+/blob/[0-9a-fA-F]{{40}}/(?P<path>[^#]+){_LINE_RANGE}\Z"
@@ -72,6 +76,7 @@ def _safe_relative_path(path: str) -> bool:
     return (
         bool(path)
         and "\\" not in path
+        and ":" not in path
         and not candidate.is_absolute()
         and ".." not in candidate.parts
         and "." not in candidate.parts
@@ -393,8 +398,8 @@ def make_runtime_query_executor() -> Callable[[EvaluationQuery], SearchResponse]
 
         bigquery_store = importlib.import_module("hermes_memory.bigquery_store")
         embeddings = importlib.import_module("hermes_memory.embeddings")
-        search_document_chunks = getattr(bigquery_store, "search_document_chunks")
-        VertexEmbeddingClient = getattr(embeddings, "VertexEmbeddingClient")
+        search_document_chunks = bigquery_store.search_document_chunks
+        VertexEmbeddingClient = embeddings.VertexEmbeddingClient
         from .config import load_config
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
@@ -488,11 +493,23 @@ def _parse_query(row: Any, index: int) -> EvaluationQuery:
     )
 
 
+def _strict_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"query fixture contains duplicate field {key!r}")
+        result[key] = value
+    return result
+
+
 def load_queries(path: str | Path) -> tuple[EvaluationQuery, ...]:
     """Load and strictly validate a JSON-compatible YAML pilot fixture."""
     fixture_path = Path(path)
     try:
-        document = json.loads(fixture_path.read_text(encoding="utf-8"))
+        document = json.loads(
+            fixture_path.read_text(encoding="utf-8"),
+            object_pairs_hook=_strict_json_object,
+        )
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid query fixture {fixture_path}: {exc}") from exc
     if not isinstance(document, dict) or any(type(key) is not str for key in document):

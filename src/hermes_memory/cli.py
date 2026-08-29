@@ -60,6 +60,8 @@ def evaluate_docs(queries_path: Path, json_path: Path):
         evaluation.write_report_json(report, json_path)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
+    if not report.pilot_gate.passed:
+        raise click.exceptions.Exit(1)
 
 
 @main.command()

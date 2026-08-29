@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 FIXTURES = Path(__file__).parent / "fixtures"
 ROOT = Path(__file__).parents[1]
 EVALUATION_CASES = (
@@ -66,8 +65,8 @@ def test_evaluation_cases_point_to_committed_fixture_answers():
 
 
 def test_load_queries_builds_deeply_immutable_contracts_from_json_compatible_yaml(tmp_path):
-    from dataclasses import FrozenInstanceError
     import json
+    from dataclasses import FrozenInstanceError
 
     import pytest
 
@@ -145,6 +144,19 @@ def test_load_queries_rejects_malformed_or_unapproved_fixtures(tmp_path):
                 "version": 1,
                 "queries": [
                     {
+                        "id": "non-string-heading",
+                        "query": "Which heading contains this?",
+                        "expected_source_path": "README.md",
+                        "expected_heading": ["Usage"],
+                    }
+                ],
+            }
+        ),
+        json.dumps(
+            {
+                "version": 1,
+                "queries": [
+                    {
                         "id": "unknown-field",
                         "query": "What is this?",
                         "expected_source_path": "README.md",
@@ -160,6 +172,48 @@ def test_load_queries_rejects_malformed_or_unapproved_fixtures(tmp_path):
         fixture.write_text(document)
         with pytest.raises(ValueError, match="query fixture"):
             load_queries(fixture)
+
+
+def test_load_queries_rejects_conflicting_duplicate_field_definitions(tmp_path):
+    import pytest
+
+    from hermes_memory.evaluation import load_queries
+
+    fixture = tmp_path / "conflicting.yaml"
+    fixture.write_text(
+        """{
+          "version": 1,
+          "queries": [{
+            "id": "conflicting-definition",
+            "query": "First definition?",
+            "query": "Second definition?",
+            "expected_source_path": "README.md"
+          }]
+        }"""
+    )
+
+    with pytest.raises(ValueError, match="duplicate field 'query'"):
+        load_queries(fixture)
+
+
+def test_search_hit_rejects_non_string_heading_path_values():
+    from typing import Any, cast
+
+    import pytest
+
+    from hermes_memory.evaluation import SearchHit
+
+    with pytest.raises(TypeError, match="heading path"):
+        SearchHit(
+            chunk_id="bad-heading",
+            source_path="README.md",
+            heading_path=cast(Any, ("Usage", 7)),
+            symbol=None,
+            start_line=1,
+            end_line=1,
+            citation="README.md#L1",
+            distance=0.1,
+        )
 
 
 def test_citation_validation_accepts_local_and_commit_pinned_github_ranges_only():
@@ -209,6 +263,55 @@ def test_citation_validation_accepts_local_and_commit_pinned_github_ranges_only(
         ),
     )
     assert [is_valid_citation(hit) for hit in invalid] == [False] * len(invalid)
+
+
+def test_citation_validation_rejects_arbitrary_urls_disguised_as_local_paths():
+    from hermes_memory.evaluation import SearchHit, is_valid_citation
+
+    for source_path in (
+        "https://example.com/repository/file.md",
+        "file:///tmp/file.md",
+        "custom:repository/file.md",
+    ):
+        hit = SearchHit(
+            chunk_id="url-1",
+            source_path=source_path,
+            heading_path=(),
+            symbol=None,
+            start_line=3,
+            end_line=3,
+            citation=f"{source_path}#L3",
+            distance=0.1,
+        )
+        assert is_valid_citation(hit) is False
+
+
+def test_citation_validation_requires_l_prefix_on_both_range_endpoints():
+    from hermes_memory.evaluation import SearchHit, is_valid_citation
+
+    local = SearchHit(
+        chunk_id="local-range",
+        source_path="main.go",
+        heading_path=(),
+        symbol=None,
+        start_line=25,
+        end_line=28,
+        citation="main.go#L25-28",
+        distance=0.1,
+    )
+    github = SearchHit(
+        **{
+            **local.__dict__,
+            "chunk_id": "github-range",
+            "citation": (
+                "https://github.com/example/repository/blob/"
+                "0123456789abcdef0123456789abcdef01234567/main.go#L25-28"
+            ),
+        }
+    )
+
+    assert is_valid_citation(local) is False
+    assert is_valid_citation(github) is False
 
 
 def test_evaluator_computes_deterministic_metrics_deduplicates_hits_and_passes_pilot_gates():
@@ -348,7 +451,7 @@ def test_evaluator_fails_closed_for_empty_input_missing_usage_and_failed_gate():
     )
 
 
-def test_runtime_query_executor_lazily_embeds_as_retrieval_query_and_searches_top_five(
+def test_offline_runtime_probe_matches_exact_task5_task9_api_and_is_lazy(
     monkeypatch,
 ):
     import sys
@@ -368,15 +471,64 @@ def test_runtime_query_executor_lazily_embeds_as_retrieval_query_and_searches_to
     )
 
     class FakeEmbeddingClient:
-        def __init__(self, **kwargs):
-            calls.append(("embedding-client", kwargs))
+        def __init__(
+            self,
+            *,
+            client,
+            model="gemini-embedding-001",
+            dimensions=768,
+            task_type="RETRIEVAL_DOCUMENT",
+            concurrency=4,
+            max_attempts=3,
+            initial_retry_delay=1.0,
+            sleep=None,
+        ):
+            calls.append(
+                (
+                    "embedding-client",
+                    {
+                        "client": client,
+                        "model": model,
+                        "dimensions": dimensions,
+                        "task_type": task_type,
+                        "concurrency": concurrency,
+                        "max_attempts": max_attempts,
+                        "initial_retry_delay": initial_retry_delay,
+                        "sleep": sleep,
+                    },
+                )
+            )
 
         def embed(self, text):
             calls.append(("embed", text))
             return SimpleNamespace(values=(0.1, 0.2, 0.3), truncated=False)
 
-    def fake_search(values, **kwargs):
-        calls.append(("search", values, kwargs))
+    def fake_search(
+        values,
+        *,
+        user_id,
+        agent_name,
+        corpus_id=None,
+        source_kind=None,
+        content_kind=None,
+        top_k=None,
+        cfg=None,
+    ):
+        calls.append(
+            (
+                "search",
+                values,
+                {
+                    "user_id": user_id,
+                    "agent_name": agent_name,
+                    "corpus_id": corpus_id,
+                    "source_kind": source_kind,
+                    "content_kind": content_kind,
+                    "top_k": top_k,
+                    "cfg": cfg,
+                },
+            )
+        )
         return [
             SimpleNamespace(
                 chunk_id="chunk-1",
@@ -403,12 +555,16 @@ def test_runtime_query_executor_lazily_embeds_as_retrieval_query_and_searches_to
     )
 
     execute = make_runtime_query_executor()
+    assert [call[0] for call in calls] == ["sdk", "embedding-client"]
     response = execute(EvaluationQuery("constructor", "Constructor?", "main.go"))
 
     embedding_call = next(call for call in calls if call[0] == "embedding-client")
     assert embedding_call[1]["task_type"] == "RETRIEVAL_QUERY"
-    assert ("embed", "Constructor?") in calls
-    search_call = next(call for call in calls if call[0] == "search")
+    assert [call for call in calls if call[0] == "embed"] == [("embed", "Constructor?")]
+    search_calls = [call for call in calls if call[0] == "search"]
+    assert len(search_calls) == 1
+    search_call = search_calls[0]
+    assert calls.index(("embed", "Constructor?")) < calls.index(search_call)
     assert search_call[1] == (0.1, 0.2, 0.3)
     assert search_call[2]["user_id"] == "test-user"
     assert search_call[2]["agent_name"] == "test-agent"
@@ -513,6 +669,62 @@ def test_evaluate_docs_cli_uses_injected_factory_and_writes_safe_exact_json(monk
     assert "BODY_MARKER_SHOULD_NOT_APPEAR" not in report_text
 
 
+def test_evaluate_docs_cli_writes_failed_gate_report_before_exiting_nonzero(monkeypatch, tmp_path):
+    import json
+
+    from click.testing import CliRunner
+
+    from hermes_memory import evaluation
+    from hermes_memory.cli import main
+
+    queries_path = tmp_path / "queries.yaml"
+    output_path = tmp_path / "report.json"
+    queries_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "queries": [
+                    {
+                        "id": "missing-answer",
+                        "query": "Where is the missing answer?",
+                        "expected_source_path": "README.md",
+                    }
+                ],
+            }
+        )
+    )
+    output_path.write_text("stale-report")
+    replacements = []
+    real_replace = evaluation.os.replace
+
+    def recording_replace(source, target):
+        replacements.append((Path(source), Path(target)))
+        real_replace(source, target)
+
+    monkeypatch.setattr(evaluation.os, "replace", recording_replace)
+    monkeypatch.setattr(
+        evaluation,
+        "make_runtime_query_executor",
+        lambda: lambda query: evaluation.SearchResponse(),
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["evaluate-docs", "--queries", str(queries_path), "--json", str(output_path)],
+    )
+
+    assert result.exit_code != 0
+    assert result.output == ""
+    assert len(replacements) == 1
+    temporary_path, replaced_path = replacements[0]
+    assert temporary_path.parent == output_path.parent
+    assert temporary_path != output_path
+    assert replaced_path == output_path
+    report = json.loads(output_path.read_text())
+    assert report["pilot_gate"]["passed"] is False
+    assert report["pilot_gate"]["failed_metrics"] == ["recall_at_5", "citation_validity"]
+
+
 def test_evaluate_docs_cli_rejects_malformed_fixture_without_touching_output(monkeypatch, tmp_path):
     from click.testing import CliRunner
 
@@ -548,6 +760,11 @@ def test_committed_pilot_fixture_has_ten_to_fifteen_approved_non_sensitive_queri
     assert {query.expected_source_path for query in queries} <= APPROVED_PILOT_SOURCE_PATHS
     assert all("credential" not in query.query.lower() for query in queries)
     assert all("secret" not in query.query.lower() for query in queries)
+    assert all(
+        query.expected_symbol is None
+        for query in queries
+        if query.expected_source_path == "main.go"
+    )
 
     source_text = {
         "Operations/agent-memory.md": (
