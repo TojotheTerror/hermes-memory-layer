@@ -2,7 +2,7 @@
 
 **Repo:** `hermes-memory-layer`
 **Integration branch:** `feat/vertex-semantic-ingestion`
-**Integration HEAD:** `fa65a692940a255ce51364a86ce2e97bf77fa901` (Tasks 1–10, 13, 14, 18 integrated)
+**Integration HEAD:** `2f5d38e` (Tasks 1–10, 13, 14, 18 integrated; 637 tests green)
 **Governing plan:** `.hermes/plans/2026-08-29_121924-vertex-semantic-ingestion.md`
 **Last updated:** 2026-08-30
 
@@ -36,7 +36,7 @@ real APPROVE — no self-approval, no merge on green CI alone.
 | 13 | Git discovery/stable citations | INTEGRATED | in `fa65a69` (source cluster) |
 | 14 | Symbol-aware code units | INTEGRATED | in `fa65a69` (chunking cluster) |
 | 18 | Retrieval-quality evaluation gate | INTEGRATED | in `ac0ac09` (`ed47e25`) |
-| 11 | Incremental Obsidian ingestion slice | PENDING | — |
+| 11 | Incremental Obsidian ingestion slice | IN REVIEW (spec + quality) | `feat/task11-obsidian-ingestion` @ `057d0de` |
 | 12 | Preview-first Obsidian CLI | PENDING | — |
 | 15 | ingest-repo / search-docs commands | PENDING | — |
 | 16 | Provenance-honest Memory Bank promotion | PENDING | — |
@@ -55,15 +55,16 @@ real APPROVE — no self-approval, no merge on green CI alone.
 - Task 18 is isolated to evaluation/CLI files.
 
 ## Active batch
-`deleg_c4bfa08e` (8 subagents): correct Tasks 8/13/14; re-review Tasks
-5/6/9/10/18. On completion: integrate each APPROVE onto the branch with
-full-suite + Ruff verification and push; loop any REQUEST-CHANGES; then advance
-to Tasks 11–19.
+`deleg_25f28524` (2 subagents): independent spec-compliance + quality/security
+review of the Task 11 candidate `057d0de`. On dual-APPROVE: integrate onto the
+branch with full-suite + Ruff verification and push. Loop any REQUEST-CHANGES.
 
 ## Next steps (in order)
-1. Consume `deleg_c4bfa08e` verdicts (ground-truth against git, not summaries).
-2. Integrate APPROVE'd tasks; re-verify full suite; push each.
-3. Re-review the three corrected tasks (8/13/14).
-4. Build Tasks 11, 12, 15, 16, 17 (each: TDD → spec review → quality review → integrate).
-5. Task 19 docs/rollback.
-6. STOP at Task 20 and Task 21 — request explicit user go-ahead.
+1. Consume `deleg_25f28524` verdicts (ground-truth against git, not summaries).
+2. On APPROVE, integrate Task 11; re-verify full suite from clean checkout; push.
+3. Fan out now-unblocked Tasks 12/15/16/17 in parallel (share settled `ingestion.py`):
+   - 12 preview-first Obsidian CLI · 15 ingest-repo/search-docs · 16 Memory Bank
+     promotion · 17 citation-aware plugin prefetch. Each: TDD → spec review →
+     quality review → integrate.
+4. Task 19 docs/rollback (needs 12).
+5. STOP at Task 20 (live pilots) and Task 21 (release tag) — explicit user go-ahead.
