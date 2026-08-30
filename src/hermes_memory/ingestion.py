@@ -20,6 +20,7 @@ from typing import Callable, Sequence
 from .chunking import (
     pack_markdown_units,
     pack_semantic_markdown_units,
+    parse_code_units,
     parse_markdown_units,
 )
 from .config import HermesMemoryConfig, load_config
@@ -29,7 +30,13 @@ from .documents import (
     make_source_id,
     sha256_text,
 )
-from .source_discovery import RejectedSource, SourcePolicy, discover_sources
+from .source_discovery import (
+    RejectedSource,
+    RepositoryDiscoveryResult,
+    SourcePolicy,
+    discover_repository,
+    discover_sources,
+)
 
 
 # Public embedding price used only for a rough, body-free cost estimate. Kept as
@@ -216,6 +223,144 @@ def _plan_source_chunks(
         relative_path=relative_path,
     )
     return chunks, token_count, units
+
+
+def _plan_code_chunks(
+    text: str,
+    *,
+    language: str,
+    source_id: str,
+    corpus_id: str,
+    relative_path: str,
+    cfg: HermesMemoryConfig,
+) -> tuple[tuple[_PlannedChunk, ...], int, tuple]:
+    """Symbol-aware chunking for a code source, packed into ready-to-embed payloads.
+
+    Uses ``parse_code_units`` for symbol boundaries and reuses the same Markdown
+    packer/assembler as the note path — code units carry no heading path, so the
+    packer groups adjacent small symbols without ever cutting one below its
+    ``max_tokens`` boundary. The parsed units are returned so apply reuses them.
+    """
+
+    units = tuple(parse_code_units(text, language, max_tokens=cfg.chunk_max_tokens))
+    packed = pack_markdown_units(
+        list(units),
+        target_tokens=cfg.chunk_target_tokens,
+        max_tokens=cfg.chunk_max_tokens,
+        overlap_tokens=cfg.chunk_overlap_tokens,
+    )
+    chunks, token_count = _assemble_chunks(
+        packed,
+        source_id=source_id,
+        corpus_id=corpus_id,
+        relative_path=relative_path,
+    )
+    return chunks, token_count, units
+
+
+def plan_repository_ingestion(
+    root: str | Path,
+    *,
+    cfg: HermesMemoryConfig | None = None,
+    user_id: str,
+    agent_name: str,
+    state_reader: StateReader,
+    policy: SourcePolicy | None = None,
+    ref: str = "HEAD",
+    for_apply: bool = False,
+    allow_dirty: bool = False,
+    discovery: RepositoryDiscoveryResult | None = None,
+) -> IngestionPlan:
+    """Plan an incremental repository ingestion without any external call.
+
+    Discovers approved, commit-pinned repository sources via
+    ``discover_repository`` (Git subprocesses are local reads, never network),
+    chunks each source symbol-aware for code and structure-aware for
+    Markdown/text, and compares each source's content hash against stored
+    ``document_sources`` state (via the injected ``state_reader``) to decide
+    discovered-vs-skipped. Constructs no cloud clients and makes no network,
+    Vertex, or BigQuery call. Citations are the commit-pinned ``source_uri`` and
+    ``revision`` resolved by discovery, so the plan cites the exact commit.
+
+    A pre-computed ``discovery`` result may be injected (tests, or to avoid a
+    second Git pass); otherwise discovery runs against ``root``.
+    """
+
+    cfg = cfg or load_config()
+    if discovery is None:
+        discovery = discover_repository(
+            root,
+            policy,
+            ref=ref,
+            for_apply=for_apply,
+            allow_dirty=allow_dirty,
+        )
+
+    discovered: list[PlannedSource] = []
+    skipped: list[PlannedSource] = []
+    rejected: list[RejectedSource] = list(discovery.rejected)
+
+    for document in discovery.sources:
+        content_hash = document.content_hash
+        state = state_reader(document.source_id, user_id=user_id, agent_name=agent_name)
+        prior_revision = state.get("revision") if state else None
+        prior_content_hash = state.get("content_hash") if state else None
+        unchanged = bool(
+            state and state.get("is_active") and state.get("content_hash") == content_hash
+        )
+
+        if document.content_kind == "code":
+            language = str(document.metadata.get("language") or "text")
+            chunks, token_count, units = _plan_code_chunks(
+                document.text,
+                language=language,
+                source_id=document.source_id,
+                corpus_id=document.corpus_id,
+                relative_path=document.relative_path,
+                cfg=cfg,
+            )
+        else:
+            chunks, token_count, units = _plan_source_chunks(
+                document.text,
+                source_id=document.source_id,
+                corpus_id=document.corpus_id,
+                relative_path=document.relative_path,
+                cfg=cfg,
+            )
+
+        record = PlannedSource(
+            source_id=document.source_id,
+            corpus_id=document.corpus_id,
+            source_kind=document.source_kind,
+            content_kind=document.content_kind,
+            relative_path=document.relative_path,
+            source_uri=document.source_uri,
+            revision=document.revision,
+            content_hash=content_hash,
+            status="skipped" if unchanged else "discovered",
+            chunk_count=0 if unchanged else len(chunks),
+            token_count=0 if unchanged else token_count,
+            prior_revision=prior_revision,
+            prior_content_hash=prior_content_hash,
+            chunks=() if unchanged else chunks,
+            units=() if unchanged else units,
+        )
+        if unchanged:
+            skipped.append(record)
+        else:
+            discovered.append(record)
+
+    chunk_count = sum(record.chunk_count for record in discovered)
+    token_count = sum(record.token_count for record in discovered)
+    return IngestionPlan(
+        discovered=tuple(discovered),
+        skipped=tuple(skipped),
+        rejected=tuple(rejected),
+        chunk_count=chunk_count,
+        request_count=chunk_count,
+        token_count=token_count,
+        cost_estimate=_cost_estimate(token_count),
+    )
 
 
 def plan_obsidian_ingestion(
