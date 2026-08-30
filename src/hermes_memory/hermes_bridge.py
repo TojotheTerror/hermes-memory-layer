@@ -1,4 +1,5 @@
 """Hermes bridge — local SQLite ↔ cloud dual-retrieval + sync."""
+
 from __future__ import annotations
 
 import json
@@ -125,7 +126,7 @@ def _strip_frontmatter(text: str) -> str:
     if text.startswith("---\n"):
         end = text.find("\n---", 4)
         if end != -1:
-            return text[end + 4:].lstrip("\n")
+            return text[end + 4 :].lstrip("\n")
     return text
 
 
@@ -140,7 +141,10 @@ def discover_obsidian_notes(vault_paths: list[str], min_chars: int = 200) -> lis
             continue
         for f in vp.rglob("*.md"):
             path_str = str(f)
-            if any(f"/{marker}/" in path_str or path_str.endswith(f"/{marker}") for marker in _SKIP_DIR_MARKERS):
+            if any(
+                f"/{marker}/" in path_str or path_str.endswith(f"/{marker}")
+                for marker in _SKIP_DIR_MARKERS
+            ):
                 continue
             try:
                 raw = f.read_text(encoding="utf-8", errors="ignore")
@@ -223,9 +227,7 @@ def read_local_memories(limit: int = 50) -> list[dict]:
         return []
 
 
-def _retrieve_bigquery_memories(
-    user_id: str, *, top_k: int, cfg: HermesMemoryConfig
-) -> list[dict]:
+def _retrieve_bigquery_memories(user_id: str, *, top_k: int, cfg: HermesMemoryConfig) -> list[dict]:
     """Retrieve structured BigQuery hits when a client is available."""
     from .bigquery_store import _bq_client, query_memories_sql
 
@@ -257,7 +259,9 @@ class HermesBridge:
     def memory_bank_name(self) -> str | None:
         return self.cfg.agent_engine_name
 
-    def retrieve_context(self, user_id: str, query: str, top_k: int = 8, agent_name: str = "hermes") -> dict:
+    def retrieve_context(
+        self, user_id: str, query: str, top_k: int = 8, agent_name: str = "hermes"
+    ) -> dict:
         """Dual retrieval: Memory Bank semantic + BigQuery SQL (mock if offline)."""
         scope = {"user_id": user_id, "agent_name": agent_name}
         bank_hits: list[dict] = []
@@ -271,7 +275,11 @@ class HermesBridge:
         else:
             # mock — don't create a real client
             bank_hits = [
-                {"fact": f"[mock] memory {i} for '{query}' (scope={scope})", "score": 0.9 - i * 0.1, "scope": scope}
+                {
+                    "fact": f"[mock] memory {i} for '{query}' (scope={scope})",
+                    "score": 0.9 - i * 0.1,
+                    "scope": scope,
+                }
                 for i in range(min(top_k, 3))
             ]
 
@@ -314,36 +322,54 @@ class HermesBridge:
             "prompt_context": "\n".join(f"- {m['fact']}" for m in merged[:top_k] if m.get("fact")),
         }
 
-    def explicit_remember(self, user_id: str, fact: str, agent_name: str = "hermes", metadata: dict | None = None) -> dict:
+    def explicit_remember(
+        self, user_id: str, fact: str, agent_name: str = "hermes", metadata: dict | None = None
+    ) -> dict:
         """Direct fact write — Memory Bank + BigQuery mirror."""
         scope = {"user_id": user_id, "agent_name": agent_name}
         result: dict[str, Any] = {"scope": scope, "fact": fact}
         if self.memory_bank_name:
             try:
-                result["memory_bank"] = generate_from_contents(self.memory_bank_name, [fact], scope, cfg=self.cfg)
+                result["memory_bank"] = generate_from_contents(
+                    self.memory_bank_name, [fact], scope, cfg=self.cfg
+                )
             except Exception as e:
                 result["memory_bank_error"] = str(e)
         # Always mirror to BigQuery (mock if offline)
         try:
-            result["bigquery"] = insert_memory(fact=fact, scope=scope, cfg=self.cfg, source="direct", metadata=metadata)
+            result["bigquery"] = insert_memory(
+                fact=fact, scope=scope, cfg=self.cfg, source="direct", metadata=metadata
+            )
         except Exception as e:
             result["bigquery_error"] = str(e)
         return result
 
-    def sync_session(self, session_name: str, user_id: str, events: list[dict] | None = None, agent_name: str = "hermes") -> dict:
+    def sync_session(
+        self,
+        session_name: str,
+        user_id: str,
+        events: list[dict] | None = None,
+        agent_name: str = "hermes",
+    ) -> dict:
         """Ship a Session's events to Memory Bank generation + BigQuery."""
         result: dict[str, Any] = {"session_name": session_name, "user_id": user_id}
         if events is not None:
             from .bigquery_store import insert_session
+
             try:
-                result["bigquery_session"] = insert_session(session_name, user_id, events, cfg=self.cfg)
+                result["bigquery_session"] = insert_session(
+                    session_name, user_id, events, cfg=self.cfg
+                )
             except Exception as e:
                 result["bigquery_error"] = str(e)
         if self.memory_bank_name:
             try:
                 # scope must exactly match the scope used at retrieval time (Memory Bank does exact-match, not subset)
                 result["memory_bank"] = generate_from_session(
-                    self.memory_bank_name, session_name, scope={"user_id": user_id, "agent_name": agent_name}, cfg=self.cfg
+                    self.memory_bank_name,
+                    session_name,
+                    scope={"user_id": user_id, "agent_name": agent_name},
+                    cfg=self.cfg,
                 )
             except Exception as e:
                 result["memory_bank_error"] = str(e)
