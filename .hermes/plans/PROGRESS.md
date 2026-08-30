@@ -2,7 +2,7 @@
 
 **Repo:** `hermes-memory-layer`
 **Integration branch:** `feat/vertex-semantic-ingestion`
-**Integration HEAD:** `48a8da260a94ec1b3c9a84c9248b23b46af9a670` (Tasks 1–4, 7 integrated)
+**Integration HEAD:** `ac0ac091c4a47de350de899e77703ac902b5570f` (Tasks 1–5, 7, 18 integrated)
 **Governing plan:** `.hermes/plans/2026-08-29_121924-vertex-semantic-ingestion.md`
 **Last updated:** 2026-08-30
 
@@ -28,14 +28,14 @@ real APPROVE — no self-approval, no merge on green CI alone.
 | 3 | Markdown structural parsing | INTEGRATED | `28362b0` (via `c7291ad`) |
 | 4 | Deterministic packing/overlap | INTEGRATED | in `48a8da2` (`2f0db4c`) |
 | 7 | BigQuery document tables | INTEGRATED | via `4fc2e2d` |
-| 5 | Vertex embedding gateway | fix pushed, re-review running | `feat/vertex-document-embeddings` @ `cebec48` |
-| 6 | Vertex semantic boundaries | fix pushed, re-review running | `feat/vertex-semantic-boundaries` @ `f0c1709` |
-| 8 | Restart-safe sync | correcting (batch+dedup) | `fix/task8-empty-batch-dimensions` @ `3700c3a` |
-| 9 | Exact filtered vector retrieval | fix pushed, re-review running | `fix/vector-search-valid-base-query` @ `0e2c788` |
-| 10 | Source allowlist/policy | fix pushed, re-review running | `fix/source-policy-stable-read` @ `0ab7625` |
-| 13 | Git discovery/stable citations | correcting (dirty parent TOCTOU) | `fix/git-discovery-stable-citations` @ `39bc070` |
-| 14 | Symbol-aware code units | correcting (RecursionError fallback) | `fix/task14-source-preservation` @ `a75df78` |
-| 18 | Retrieval-quality evaluation gate | fix pushed, re-review running | `fix/evaluation-pilot-gate` @ `ed47e25` |
+| 5 | Vertex embedding gateway | INTEGRATED | in `ac0ac09` (`cebec48`) |
+| 6 | Vertex semantic boundaries | APPROVED, awaits chunking cluster | `feat/vertex-semantic-boundaries` @ `f0c1709` |
+| 8 | Restart-safe sync | corrected, final re-review running | `fix/task8-empty-batch-dimensions` @ `37bba66` |
+| 9 | Exact filtered vector retrieval | APPROVED, awaits BigQuery cluster | `fix/vector-search-valid-base-query` @ `0e2c788` |
+| 10 | Source allowlist/policy | APPROVED, awaits source cluster | `fix/source-policy-stable-read` @ `0ab7625` |
+| 13 | Git discovery/stable citations | corrected, final re-review running | `fix/git-discovery-stable-citations` @ `480af31` |
+| 14 | Symbol-aware code units | corrected, final re-review running | `fix/task14-source-preservation` @ `d9c7982` |
+| 18 | Retrieval-quality evaluation gate | INTEGRATED | in `ac0ac09` (`ed47e25`) |
 | 11 | Incremental Obsidian ingestion slice | PENDING | — |
 | 12 | Preview-first Obsidian CLI | PENDING | — |
 | 15 | ingest-repo / search-docs commands | PENDING | — |
