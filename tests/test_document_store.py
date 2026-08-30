@@ -34,6 +34,9 @@ CHUNK_FIELDS = [
     ("corpus_id", "STRING", "REQUIRED"),
     ("user_id", "STRING", "REQUIRED"),
     ("agent_name", "STRING", "REQUIRED"),
+    ("source_kind", "STRING", "REQUIRED"),
+    ("content_kind", "STRING", "REQUIRED"),
+    ("relative_path", "STRING", "REQUIRED"),
     ("ordinal", "INT64", "REQUIRED"),
     ("content", "STRING", "REQUIRED"),
     ("contextual_content", "STRING", "REQUIRED"),
@@ -329,6 +332,9 @@ def _chunk(**overrides):
         "chunk_id": "chunk-1",
         "source_id": "source-1",
         "corpus_id": "corpus-1",
+        "source_kind": "obsidian",
+        "content_kind": "markdown",
+        "relative_path": "notes/example.md",
         "ordinal": 0,
         "text": "Chunk body",
         "contextual_text": "Heading\nChunk body",
@@ -492,6 +498,123 @@ def test_insert_chunks_uses_chunk_ids_as_deterministic_insert_ids(monkeypatch):
     assert all(row["is_active"] is False for row in rows)
     assert all(row["embedding_model"] == "test-embedding-model" for row in rows)
     assert all(row["embedding_dimensions"] == 3 for row in rows)
+
+
+def test_insert_chunks_writes_denormalized_source_fields(monkeypatch):
+    chunk = _chunk(source_kind="git", content_kind="code", relative_path="pkg/mod.py")
+    client = _StoreFakeClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    bigquery_store.insert_chunks(
+        [chunk],
+        user_id="user-1",
+        agent_name="hermes",
+        embedding_model="test-embedding-model",
+        embedding_dimensions=3,
+        cfg=cfg,
+    )
+
+    _table, rows, _row_ids = client.inserts[0]
+    assert rows[0]["source_kind"] == "git"
+    assert rows[0]["content_kind"] == "code"
+    assert rows[0]["relative_path"] == "pkg/mod.py"
+
+
+def test_insert_chunks_splits_into_bounded_row_count_batches(monkeypatch):
+    row_cap = bigquery_store._MAX_INSERT_ROWS
+    count = row_cap * 2 + 1
+    chunks = [_chunk(chunk_id=f"chunk-{i}", ordinal=i) for i in range(count)]
+    client = _StoreFakeClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    inserted = bigquery_store.insert_chunks(
+        chunks,
+        user_id="user-1",
+        agent_name="hermes",
+        embedding_model="test-embedding-model",
+        embedding_dimensions=3,
+        cfg=cfg,
+    )
+
+    assert inserted == count
+    assert len(client.inserts) == 3
+    assert all(len(rows) <= row_cap for _table, rows, _ids in client.inserts)
+    # Every batch's row_ids track its own rows, and the whole insert is an
+    # exact, order-preserving partition of the input with no drops/duplicates.
+    for _table, rows, row_ids in client.inserts:
+        assert row_ids == [row["chunk_id"] for row in rows]
+    flat_rows = [row["chunk_id"] for _t, rows, _i in client.inserts for row in rows]
+    flat_ids = [row_id for _t, _r, row_ids in client.inserts for row_id in row_ids]
+    expected = [chunk["chunk_id"] for chunk in chunks]
+    assert flat_rows == expected
+    assert flat_ids == expected
+
+
+def test_insert_chunks_splits_into_bounded_byte_size_batches(monkeypatch):
+    # Force the byte cap, not the row cap, to be the binding constraint so the
+    # split proves payloads stay under the client's insertAll size limit.
+    monkeypatch.setattr(bigquery_store, "_MAX_INSERT_BYTES", 2000)
+    monkeypatch.setattr(bigquery_store, "_MAX_INSERT_ROWS", 10_000)
+    chunks = [_chunk(chunk_id=f"chunk-{i}", ordinal=i, text="x" * 500) for i in range(10)]
+    client = _StoreFakeClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    inserted = bigquery_store.insert_chunks(
+        chunks,
+        user_id="user-1",
+        agent_name="hermes",
+        embedding_model="test-embedding-model",
+        embedding_dimensions=3,
+        cfg=cfg,
+    )
+
+    assert inserted == len(chunks)
+    assert len(client.inserts) > 1
+    for _table, rows, row_ids in client.inserts:
+        payload = sum(bigquery_store._row_json_bytes(row) for row in rows)
+        # A batch may exceed the cap only when it is a single unsplittable row.
+        assert payload <= bigquery_store._MAX_INSERT_BYTES or len(rows) == 1
+        assert row_ids == [row["chunk_id"] for row in rows]
+    flat_ids = [row_id for _t, _r, row_ids in client.inserts for row_id in row_ids]
+    assert flat_ids == [chunk["chunk_id"] for chunk in chunks]
+
+
+def test_insert_chunks_rejects_duplicate_chunk_ids_before_client(monkeypatch):
+    client_acquisitions = []
+    client = _StoreFakeClient()
+
+    def acquire_client(cfg):
+        client_acquisitions.append(cfg)
+        return client
+
+    monkeypatch.setattr(bigquery_store, "_bq_client", acquire_client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+    chunks = [
+        _chunk(chunk_id="duplicate", ordinal=0, text="private-source-content"),
+        _chunk(chunk_id="duplicate", ordinal=1, text="private-second-content"),
+    ]
+
+    with pytest.raises(ValueError, match="duplicate") as exc_info:
+        bigquery_store.insert_chunks(
+            chunks,
+            user_id="private-user-credential",
+            agent_name="private-agent-credential",
+            embedding_model="test-embedding-model",
+            embedding_dimensions=3,
+            cfg=cfg,
+        )
+
+    error = str(exc_info.value)
+    assert "private-source-content" not in error
+    assert "private-second-content" not in error
+    assert "private-user-credential" not in error
+    assert "private-agent-credential" not in error
+    assert client_acquisitions == []
+    assert client.queries == []
+    assert client.inserts == []
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,20 @@ import re
 
 from .config import HermesMemoryConfig, load_config
 
+# BigQuery's streaming insertAll caps a single request at ~10 MB and a bounded
+# row count. Split large chunk inserts so no request exceeds either limit; the
+# byte budget stays under 10 MB with headroom for request envelope overhead.
+_MAX_INSERT_ROWS = 500
+_MAX_INSERT_BYTES = 9_000_000
+
+
+def _row_json_bytes(row: dict) -> int:
+    """Estimate a row's serialized insertAll payload size in bytes."""
+    import json as _json
+
+    return len(_json.dumps(row, default=str, ensure_ascii=False).encode("utf-8"))
+
+
 # DDL lives in bigquery/*.sql for review; Python helpers are thin wrappers
 # so `bq` CLI or Terraform can also apply them without Python.
 
@@ -80,6 +94,9 @@ DDL_DOCUMENT_CHUNKS = """CREATE TABLE IF NOT EXISTS `{project}.{dataset}.documen
   corpus_id STRING NOT NULL,
   user_id STRING NOT NULL,
   agent_name STRING NOT NULL,
+  source_kind STRING NOT NULL,
+  content_kind STRING NOT NULL,
+  relative_path STRING NOT NULL,
   ordinal INT64 NOT NULL,
   content STRING NOT NULL,
   contextual_content STRING NOT NULL,
@@ -318,7 +335,14 @@ def insert_chunks(
         return 0
     cfg = cfg or load_config()
     _validate_ddl_identifiers(cfg)
+    seen_chunk_ids: set = set()
     for chunk in chunks:
+        chunk_id = chunk.get("chunk_id")
+        if chunk_id in seen_chunk_ids:
+            # Chunk IDs double as retry-stable insert IDs; duplicates would
+            # collapse rows and corrupt insert-count and completeness accounting.
+            raise ValueError("duplicate chunk_id in insert batch")
+        seen_chunk_ids.add(chunk_id)
         declared_dimensions = chunk.get("embedding_dimensions")
         _validate_embedding_dimensions(declared_dimensions)
         if chunk.get("embedding_model") != embedding_model:
@@ -344,6 +368,9 @@ def insert_chunks(
             "corpus_id": chunk["corpus_id"],
             "user_id": user_id,
             "agent_name": agent_name,
+            "source_kind": chunk["source_kind"],
+            "content_kind": chunk["content_kind"],
+            "relative_path": chunk["relative_path"],
             "ordinal": chunk["ordinal"],
             "content": chunk["text"],
             "contextual_content": chunk["contextual_text"],
@@ -364,11 +391,38 @@ def insert_chunks(
         for chunk in chunks
     ]
     table = f"{cfg.project}.{cfg.bq_dataset}.document_chunks"
-    row_ids = [chunk["chunk_id"] for chunk in chunks]
-    errors = client.insert_rows_json(table, rows, row_ids=row_ids)
-    if errors:
-        raise RuntimeError(f"BigQuery chunk insert failed: {errors}")
-    return len(rows)
+    inserted = 0
+    for batch_rows, batch_ids in _batched_insert_rows(rows):
+        errors = client.insert_rows_json(table, batch_rows, row_ids=batch_ids)
+        if errors:
+            raise RuntimeError(f"BigQuery chunk insert failed: {errors}")
+        inserted += len(batch_rows)
+    return inserted
+
+
+def _batched_insert_rows(rows: list[dict]):
+    """Yield (rows, row_ids) batches bounded by row count and payload bytes.
+
+    Each batch stays within `_MAX_INSERT_ROWS` and `_MAX_INSERT_BYTES`; a single
+    row that alone exceeds the byte cap is emitted as its own batch rather than
+    dropped, so the yielded batches always form an exact, order-preserving
+    partition of `rows` with no drops or duplicates.
+    """
+    batch: list[dict] = []
+    batch_ids: list[str] = []
+    batch_bytes = 0
+    for row in rows:
+        row_bytes = _row_json_bytes(row)
+        if batch and (
+            len(batch) >= _MAX_INSERT_ROWS or batch_bytes + row_bytes > _MAX_INSERT_BYTES
+        ):
+            yield batch, batch_ids
+            batch, batch_ids, batch_bytes = [], [], 0
+        batch.append(row)
+        batch_ids.append(row["chunk_id"])
+        batch_bytes += row_bytes
+    if batch:
+        yield batch, batch_ids
 
 
 def finalize_source_revision(
