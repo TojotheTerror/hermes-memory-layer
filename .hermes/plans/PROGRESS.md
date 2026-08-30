@@ -45,6 +45,14 @@ real APPROVE — no self-approval, no merge on green CI alone.
 | 20 | Live GCP pilots + fleet verification | GATED (user go-ahead) | — |
 | 21 | Independent review, PR/CI, merge, release tag | GATED (user go-ahead) | — |
 
+## User decision log
+- 2026-08-30: User APPROVED proceeding into the Task 20 live pilot (billed
+  Vertex + BigQuery DDL + 5-note Obsidian ingestion + Memory Bank promotion +
+  runtime verification), CONDITIONAL on the code being fully built and
+  independently reviewed first. Task 21 release tag still requires a separate
+  explicit go-ahead. Confirm exact commands at the moment of each billed/
+  irreversible step before running it.
+
 ## Integration reconciliation clusters
 - **Chunking:** Tasks 4 (integrated) / 6 / 14 — cherry-pick only the isolated
   Task 6 commit from its composite branch; reconcile with corrected Task 14.
