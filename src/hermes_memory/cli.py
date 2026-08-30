@@ -208,6 +208,18 @@ def _build_state_reader(cfg):
     return reader
 
 
+def _discover_repository(root, policy, *, ref, for_apply, allow_dirty):
+    """Discover a Git repository read-only (Git subprocesses only; no network).
+
+    Wrapped as a module-level seam so tests can inject a fake discovery result.
+    Discovery itself constructs no cloud client and makes no network call, so it
+    is safe on a dry run — the seam boundary keeps tests able to prove that.
+    """
+    from .source_discovery import discover_repository
+
+    return discover_repository(root, policy, ref=ref, for_apply=for_apply, allow_dirty=allow_dirty)
+
+
 def _build_insert_chunks(cfg):
     from . import bigquery_store
 
@@ -224,6 +236,35 @@ def _build_semantic_gateway(cfg):
     # No semantic boundary gateway wired for the personal CLI yet; structural
     # chunks are used as-is. Returning None keeps apply on the deterministic path.
     return None
+
+
+# --- Retrieval-time dependency seams ----------------------------------------
+#
+# search-docs constructs exactly one embedding client (to embed the query once)
+# and calls one search function. Both are module-level seams so tests inject
+# fakes and prove the command constructs no real client and makes no network
+# call. The task type is chosen by the caller: RETRIEVAL_QUERY for documents,
+# CODE_RETRIEVAL_QUERY for code.
+
+
+def _build_query_embedding_client(cfg, *, task_type):
+    from google import genai
+
+    from .embeddings import VertexEmbeddingClient
+
+    sdk_client = genai.Client(vertexai=True, project=cfg.project, location=cfg.location)
+    return VertexEmbeddingClient(
+        client=sdk_client,
+        model=cfg.document_embedding_model,
+        dimensions=cfg.document_embedding_dimensions,
+        task_type=task_type,
+    )
+
+
+def _search_document_chunks(query_embedding, **kwargs):
+    from . import bigquery_store
+
+    return bigquery_store.search_document_chunks(query_embedding, **kwargs)
 
 
 def _build_memory_bank(cfg):
@@ -548,6 +589,416 @@ def ingest_obsidian(
         click.echo(json.dumps(payload, indent=2, sort_keys=True))
     else:
         click.echo(_render_report(report, user_id=user_id, agent_name=agent_name))
+
+
+def _repo_plan_payload(plan, *, mode, user_id, agent_name):
+    """Deterministic, body-free serializable view of a repository plan.
+
+    Extends the shared per-source detail with the commit-pinned ``source_uri``
+    and ``revision`` so evaluation tooling gets the exact citation without any
+    file body.
+    """
+    return {
+        "mode": mode,
+        "user_id": user_id,
+        "agent_name": agent_name,
+        "counts": {
+            "discovered": len(plan.discovered),
+            "skipped": len(plan.skipped),
+            "rejected": len(plan.rejected),
+            "chunks": plan.chunk_count,
+            "requests": plan.request_count,
+            "tokens": plan.token_count,
+        },
+        "cost_estimate": plan.cost_estimate,
+        "discovered": [
+            {
+                "relative_path": s.relative_path,
+                "status": s.status,
+                "chunk_count": s.chunk_count,
+                "token_count": s.token_count,
+                "source_uri": s.source_uri,
+                "revision": s.revision,
+            }
+            for s in _sorted_sources(plan.discovered)
+        ],
+        "skipped": [
+            {
+                "relative_path": s.relative_path,
+                "status": s.status,
+                "chunk_count": s.chunk_count,
+                "token_count": s.token_count,
+                "source_uri": s.source_uri,
+                "revision": s.revision,
+            }
+            for s in _sorted_sources(plan.skipped)
+        ],
+        "rejected": [{"path": r.path, "rule": r.rule} for r in _sorted_rejected(plan.rejected)],
+    }
+
+
+def _render_repo_plan(plan, *, mode, user_id, agent_name, root, ref, revision):
+    """Render a deterministic, body-free repository plan table (never prints bodies)."""
+    lines: list[str] = []
+    lines.append(
+        f"Repository ingestion {mode} — user_id={user_id} agent_name={agent_name} "
+        f"root={root} ref={ref} revision={revision}"
+    )
+    if mode == "preview":
+        lines.append("(dry run: no BigQuery/Vertex client constructed; no writes)")
+    lines.append(
+        f"discovered={len(plan.discovered)} skipped={len(plan.skipped)} "
+        f"rejected={len(plan.rejected)}"
+    )
+    lines.append(
+        f"chunks={plan.chunk_count} requests={plan.request_count} "
+        f"tokens={plan.token_count} cost_estimate=${plan.cost_estimate:.6f}"
+    )
+    if plan.discovered:
+        lines.append("discovered sources:")
+        for s in _sorted_sources(plan.discovered):
+            lines.append(
+                f"  [{s.status}] {s.relative_path} "
+                f"(chunks={s.chunk_count}, tokens={s.token_count}) {s.source_uri}"
+            )
+    if plan.skipped:
+        lines.append("skipped sources:")
+        for s in _sorted_sources(plan.skipped):
+            lines.append(f"  [skipped] {s.relative_path} {s.source_uri}")
+    if plan.rejected:
+        lines.append("rejected sources:")
+        for r in _sorted_rejected(plan.rejected):
+            lines.append(f"  [rejected:{r.rule}] {r.path}")
+    return "\n".join(lines)
+
+
+def _repo_report_payload(report, plan, *, user_id, agent_name):
+    """Deterministic, body-free serializable view of a repository apply report.
+
+    The apply outcome carries no source_uri/revision, so those commit-pinned
+    fields are joined back from the plan by source relative_path.
+    """
+    uri_by_path = {s.relative_path: (s.source_uri, s.revision) for s in plan.discovered}
+    return {
+        "mode": "apply",
+        "user_id": user_id,
+        "agent_name": agent_name,
+        "counts": {
+            "written": len(report.discovered),
+            "skipped": len(report.skipped),
+            "rejected": len(report.rejected),
+            "chunks": report.chunk_count,
+            "requests": report.request_count,
+            "tokens": report.token_count,
+        },
+        "cost_estimate": report.cost_estimate,
+        "written": [
+            {
+                "relative_path": o.relative_path,
+                "status": o.status,
+                "chunk_count": o.chunk_count,
+                "token_count": o.token_count,
+                "source_uri": uri_by_path.get(o.relative_path, ("", ""))[0],
+                "revision": uri_by_path.get(o.relative_path, ("", ""))[1],
+            }
+            for o in sorted(report.discovered, key=lambda o: o.relative_path)
+        ],
+        "skipped": [
+            {"relative_path": o.relative_path, "status": o.status}
+            for o in sorted(report.skipped, key=lambda o: o.relative_path)
+        ],
+        "rejected": [{"path": r.path, "rule": r.rule} for r in _sorted_rejected(report.rejected)],
+    }
+
+
+def _render_repo_report(report, plan, *, user_id, agent_name, root, ref, revision):
+    """Render a deterministic, body-free repository apply report (never prints bodies)."""
+    uri_by_path = {s.relative_path: s.source_uri for s in plan.discovered}
+    lines: list[str] = []
+    lines.append(
+        f"Repository ingestion applied — user_id={user_id} agent_name={agent_name} "
+        f"root={root} ref={ref} revision={revision}"
+    )
+    lines.append(
+        f"written={len(report.discovered)} skipped={len(report.skipped)} "
+        f"rejected={len(report.rejected)}"
+    )
+    lines.append(
+        f"chunks={report.chunk_count} requests={report.request_count} "
+        f"tokens={report.token_count} cost_estimate=${report.cost_estimate:.6f}"
+    )
+    if report.discovered:
+        lines.append("written sources:")
+        for o in sorted(report.discovered, key=lambda o: o.relative_path):
+            lines.append(
+                f"  [{o.status}] {o.relative_path} "
+                f"(chunks={o.chunk_count}, tokens={o.token_count}) "
+                f"{uri_by_path.get(o.relative_path, '')}"
+            )
+    return "\n".join(lines)
+
+
+def _build_repo_policy(includes, excludes, languages):
+    """Build a SourcePolicy from CLI include/exclude/language filters.
+
+    A ``--language`` filter is expressed as include globs over that language's
+    file extensions, composed with any explicit ``--include`` patterns.
+    """
+    from .source_discovery import _CODE_LANGUAGES, SourcePolicy
+
+    include_patterns = list(includes)
+    if languages:
+        wanted = {lang.strip().lower() for lang in languages if lang and lang.strip()}
+        for extension, language in _CODE_LANGUAGES.items():
+            if language in wanted:
+                include_patterns.append(f"*{extension}")
+    # A Git repository is itself the allowlist: without an explicit --include or
+    # --language filter, every tracked file that survives the default-deny rules
+    # (secrets, generated, binary, ...) is eligible, so apply needs no synthetic
+    # include pattern. An explicit filter narrows that set instead.
+    return SourcePolicy(
+        include_patterns=tuple(include_patterns),
+        exclude_patterns=tuple(excludes),
+        allow_all_approved=not include_patterns,
+    )
+
+
+@main.command("ingest-repo")
+@click.option("--user", "user_id", required=True, help="user_id scope")
+@click.option("--agent", "agent_name", default="hermes", help="agent_name scope")
+@click.option("--repo", "repo_root", required=True, help="Repository root (Git top level).")
+@click.option("--ref", default="HEAD", help="Git ref to pin (must match the checked-out commit).")
+@click.option(
+    "--include",
+    "includes",
+    multiple=True,
+    help="Include glob (allowlist). Repeatable. Composes with --language.",
+)
+@click.option("--exclude", "excludes", multiple=True, help="Exclude glob. Repeatable.")
+@click.option(
+    "--language",
+    "languages",
+    multiple=True,
+    help="Restrict to one or more code languages (e.g. python, go). Repeatable.",
+)
+@click.option("--apply", "apply_writes", is_flag=True, help="Perform writes (required to write).")
+@click.option(
+    "--allow-dirty",
+    is_flag=True,
+    help="Permit --apply on a dirty worktree (citations become -dirty local URIs).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit the plan/report as deterministic JSON.")
+def ingest_repo(
+    user_id,
+    agent_name,
+    repo_root,
+    ref,
+    includes,
+    excludes,
+    languages,
+    apply_writes,
+    allow_dirty,
+    as_json,
+):
+    """Preview or apply semantic ingestion of a Git repository.
+
+    Preview-first: with no ``--apply`` this only plans and prints what *would*
+    be written, constructing no cloud client and making no network call (Git
+    subprocesses are local reads). ``--apply`` performs the writes through the
+    same IngestionPlan/apply path used by Obsidian and requires a clean worktree
+    unless ``--allow-dirty`` is given. Citations are commit-pinned to the exact
+    ref. Output is deterministic and body-free (never prints file contents).
+    """
+    from . import ingestion
+    from .config import load_config
+    from .source_discovery import RepositoryDirtyError, RepositoryDiscoveryError
+
+    policy = _build_repo_policy(includes, excludes, languages)
+    cfg = load_config()
+
+    if not apply_writes:
+        # Preview: no seam is called, so no cloud client is constructed and no
+        # network call is made. Discovery runs read-only against the local Git
+        # repository; state is read through the preview-safe reader only.
+        try:
+            discovery = _discover_repository(
+                repo_root, policy, ref=ref, for_apply=False, allow_dirty=allow_dirty
+            )
+        except (RepositoryDirtyError, RepositoryDiscoveryError) as error:
+            raise click.ClickException(str(error)) from None
+        plan = ingestion.plan_repository_ingestion(
+            repo_root,
+            cfg=cfg,
+            user_id=user_id,
+            agent_name=agent_name,
+            state_reader=_dry_run_state_reader,
+            discovery=discovery,
+        )
+        if as_json:
+            payload = _repo_plan_payload(
+                plan, mode="preview", user_id=user_id, agent_name=agent_name
+            )
+            click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            click.echo(
+                _render_repo_plan(
+                    plan,
+                    mode="preview",
+                    user_id=user_id,
+                    agent_name=agent_name,
+                    root=discovery.state.root,
+                    ref=ref,
+                    revision=discovery.state.revision,
+                )
+            )
+        return
+
+    # --- apply path: real dependencies built through injectable seams ---------
+    try:
+        discovery = _discover_repository(
+            repo_root, policy, ref=ref, for_apply=True, allow_dirty=allow_dirty
+        )
+    except RepositoryDirtyError as error:
+        raise click.ClickException(str(error)) from None
+    except RepositoryDiscoveryError as error:
+        raise click.ClickException(str(error)) from None
+
+    state_reader = _build_state_reader(cfg)
+    plan = ingestion.plan_repository_ingestion(
+        repo_root,
+        cfg=cfg,
+        user_id=user_id,
+        agent_name=agent_name,
+        state_reader=state_reader,
+        discovery=discovery,
+    )
+    report = ingestion.apply_ingestion_plan(
+        plan,
+        cfg=cfg,
+        user_id=user_id,
+        agent_name=agent_name,
+        embedding_client=_build_embedding_client(cfg),
+        insert_chunks=_build_insert_chunks(cfg),
+        finalize_source_revision=_build_finalize_source_revision(cfg),
+        semantic_gateway=_build_semantic_gateway(cfg),
+    )
+    if as_json:
+        payload = _repo_report_payload(report, plan, user_id=user_id, agent_name=agent_name)
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        click.echo(
+            _render_repo_report(
+                report,
+                plan,
+                user_id=user_id,
+                agent_name=agent_name,
+                root=discovery.state.root,
+                ref=ref,
+                revision=discovery.state.revision,
+            )
+        )
+
+
+def _search_result_payload(results):
+    """Deterministic, body-free-of-secrets serializable view of search hits.
+
+    Each entry carries only the excerpt the search already returned plus its
+    citation and locating metadata — never an embedding, a secret, or any file
+    body beyond the returned excerpt. Ranking follows the search order.
+    """
+    return [
+        {
+            "rank": index + 1,
+            "distance": result.distance,
+            "citation": result.citation,
+            "source_path": result.source_path,
+            "heading_path": list(result.heading_path),
+            "symbol": result.symbol,
+            "start_line": result.start_line,
+            "end_line": result.end_line,
+            "excerpt": result.content,
+            "chunk_id": result.chunk_id,
+            "source_id": result.source_id,
+            "corpus_id": result.corpus_id,
+        }
+        for index, result in enumerate(results)
+    ]
+
+
+def _render_search_results(results, *, user_id, agent_name, query_type):
+    """Render ranked excerpts + citations; never prints embeddings or secrets."""
+    lines: list[str] = []
+    lines.append(
+        f"search-docs — user_id={user_id} agent_name={agent_name} "
+        f"query_type={query_type} results={len(results)}"
+    )
+    if not results:
+        lines.append("no results")
+        return "\n".join(lines)
+    for index, result in enumerate(results):
+        heading = " / ".join(result.heading_path) if result.heading_path else ""
+        locator = result.symbol or heading
+        suffix = f" [{locator}]" if locator else ""
+        lines.append(f"  {index + 1}. ({result.distance:.4f}) {result.citation}{suffix}")
+        lines.append(f"     {result.content}")
+    return "\n".join(lines)
+
+
+@main.command("search-docs")
+@click.option("--user", "user_id", required=True, help="user_id scope")
+@click.option("--agent", "agent_name", default="hermes", help="agent_name scope")
+@click.option("--query", required=True, help="Natural-language or code query.")
+@click.option(
+    "--query-type",
+    type=click.Choice(["docs", "code"]),
+    default="docs",
+    help="docs -> RETRIEVAL_QUERY (default); code -> CODE_RETRIEVAL_QUERY.",
+)
+@click.option("--corpus", "corpus_id", default=None, help="Restrict to a corpus_id.")
+@click.option("--top-k", default=None, type=int, help="Max ranked results.")
+@click.option("--json", "as_json", is_flag=True, help="Emit ranked results as deterministic JSON.")
+def search_docs(user_id, agent_name, query, query_type, corpus_id, top_k, as_json):
+    """Search ingested document/code chunks and print ranked excerpts + citations.
+
+    The query is embedded exactly once — with ``RETRIEVAL_QUERY`` for documents
+    or ``CODE_RETRIEVAL_QUERY`` when ``--query-type code`` — and the resulting
+    vector is searched against active, tenant-scoped chunks. Output is limited to
+    each hit's returned excerpt and citation; it never prints embeddings,
+    credentials, or any file body beyond the excerpt the search returned.
+    """
+    from .config import load_config
+
+    cfg = load_config()
+    task_type = "CODE_RETRIEVAL_QUERY" if query_type == "code" else "RETRIEVAL_QUERY"
+    content_kind = "code" if query_type == "code" else None
+
+    embedding_client = _build_query_embedding_client(cfg, task_type=task_type)
+    embedded = embedding_client.embed(query)
+    results = _search_document_chunks(
+        tuple(embedded.values),
+        user_id=user_id,
+        agent_name=agent_name,
+        corpus_id=corpus_id,
+        content_kind=content_kind,
+        top_k=top_k,
+        cfg=cfg,
+    )
+
+    if as_json:
+        payload = {
+            "user_id": user_id,
+            "agent_name": agent_name,
+            "query_type": query_type,
+            "count": len(results),
+            "results": _search_result_payload(results),
+        }
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        click.echo(
+            _render_search_results(
+                results, user_id=user_id, agent_name=agent_name, query_type=query_type
+            )
+        )
 
 
 if __name__ == "__main__":
