@@ -300,20 +300,65 @@ def _dirty_stat_signature(info: os.stat_result) -> tuple[int, int, int, int, int
     )
 
 
-def _read_dirty_source_bytes(path: Path) -> _DirtySourceRead:
+def _open_contained_descriptor(root: Path, relative_path: str) -> tuple[int, int]:
+    """Open *relative_path* under *root* through an openat-style O_NOFOLLOW chain.
+
+    Every path component is opened relative to the previously validated directory
+    descriptor with ``O_NOFOLLOW``, so a symlinked parent directory (or a symlinked
+    final component) fails closed with an :class:`OSError` instead of letting the
+    traversal escape the repository root. The returned leaf descriptor is therefore
+    bound to a single object reached only through validated, in-repository directories.
+    """
+
     no_follow = getattr(os, "O_NOFOLLOW", None)
-    if no_follow is None:
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory_flag is None:
         raise OSError("safe local source reads are unavailable")
-    descriptor = os.open(path, os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0))
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    components = PurePosixPath(relative_path).parts
+    if not components or any(part in {"", ".", ".."} for part in components):
+        raise OSError("local source path is not repository-relative")
+    directory_fds: list[int] = []
+    leaf_fd: int | None = None
     try:
-        before = os.fstat(descriptor)
+        root_fd = os.open(root, os.O_RDONLY | directory_flag | no_follow | cloexec)
+        directory_fds.append(root_fd)
+        root_dev = os.fstat(root_fd).st_dev
+        *directories, leaf = components
+        parent_fd = root_fd
+        for name in directories:
+            child_fd = os.open(
+                name, os.O_RDONLY | directory_flag | no_follow | cloexec, dir_fd=parent_fd
+            )
+            directory_fds.append(child_fd)
+            if os.fstat(child_fd).st_dev != root_dev:
+                raise OSError("local source escaped repository")
+            parent_fd = child_fd
+        leaf_fd = os.open(leaf, os.O_RDONLY | no_follow | cloexec, dir_fd=parent_fd)
+    except OSError:
+        if leaf_fd is not None:
+            os.close(leaf_fd)
+        raise
+    finally:
+        for fd in directory_fds:
+            os.close(fd)
+    return leaf_fd, root_dev
+
+
+def _read_dirty_source_bytes(root: Path, path: Path) -> _DirtySourceRead:
+    relative_path = path.relative_to(root).as_posix()
+    leaf_fd, root_dev = _open_contained_descriptor(root, relative_path)
+    try:
+        before = os.fstat(leaf_fd)
         if not stat.S_ISREG(before.st_mode):
             raise OSError("local source is not a regular file")
-        with os.fdopen(descriptor, "rb", closefd=False) as source:
+        if before.st_dev != root_dev:
+            raise OSError("local source escaped repository")
+        with os.fdopen(leaf_fd, "rb", closefd=False) as source:
             content = source.read()
-        after = os.fstat(descriptor)
+        after = os.fstat(leaf_fd)
     finally:
-        os.close(descriptor)
+        os.close(leaf_fd)
     signature = _dirty_stat_signature(after)
     if _dirty_stat_signature(before) != signature or len(content) != after.st_size:
         raise OSError("local source changed while being read")
@@ -321,19 +366,19 @@ def _read_dirty_source_bytes(path: Path) -> _DirtySourceRead:
 
 
 def _dirty_source_uri(root: Path, path: Path, source: _DirtySourceRead) -> str:
-    resolved_path = path.resolve(strict=True)
-    if not resolved_path.is_relative_to(root):
-        raise OSError("local source escaped repository")
-    current = os.stat(path, follow_symlinks=False)
-    if not stat.S_ISREG(current.st_mode) or _dirty_stat_signature(current) != source.stat_signature:
+    relative_path = path.relative_to(root).as_posix()
+    leaf_fd, root_dev = _open_contained_descriptor(root, relative_path)
+    try:
+        current = os.fstat(leaf_fd)
+    finally:
+        os.close(leaf_fd)
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_dev != root_dev
+        or _dirty_stat_signature(current) != source.stat_signature
+    ):
         raise OSError("local source changed after being read")
-    source_uri = resolved_path.as_uri()
-    if path.resolve(strict=True) != resolved_path:
-        raise OSError("local source path changed")
-    current = os.stat(path, follow_symlinks=False)
-    if not stat.S_ISREG(current.st_mode) or _dirty_stat_signature(current) != source.stat_signature:
-        raise OSError("local source changed after citation derivation")
-    return source_uri
+    return (root / relative_path).as_uri()
 
 
 def _matches(path: str, patterns: Iterable[str]) -> bool:
@@ -759,7 +804,7 @@ def discover_repository(
                 text = content.decode("utf-8")
                 source_uri = f"{remote}/blob/{revision}/{quote(relative_path, safe='/')}"
             elif dirty:
-                dirty_source = _read_dirty_source_bytes(path)
+                dirty_source = _read_dirty_source_bytes(root_path, path)
                 content = dirty_source.content
                 if len(content) > active_policy.max_file_size_bytes:
                     rejected.append(RejectedSource(relative_path, "max_file_size"))

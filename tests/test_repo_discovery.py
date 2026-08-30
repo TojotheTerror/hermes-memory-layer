@@ -286,6 +286,50 @@ def test_dirty_source_rejects_final_component_outside_symlink_swap_after_last_ch
     assert outside.as_uri() not in repr(result)
 
 
+def test_dirty_source_rejects_parent_directory_outside_symlink_swap_before_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repository"
+    _init_repo(repo)
+    docs = repo / "docs"
+    docs.mkdir()
+    source_path = docs / "target.md"
+    source_path.write_text("approved dirty bytes\n", encoding="utf-8")
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (outside_dir / "target.md").write_text(
+        "api_key = AKIAoutsidecredential0123\n", encoding="utf-8"
+    )
+    real_read = source_discovery._read_dirty_source_bytes
+    swap_happened = False
+
+    def swap_parent_then_read(*args: Any, **kwargs: Any) -> Any:
+        nonlocal swap_happened
+        if not swap_happened:
+            docs.rename(tmp_path / "docs-moved")
+            docs.symlink_to(outside_dir, target_is_directory=True)
+            swap_happened = True
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(source_discovery, "_read_dirty_source_bytes", swap_parent_then_read)
+
+    result = discover_repository(
+        repo,
+        SourcePolicy(include_patterns=("docs/target.md",)),
+        for_apply=True,
+        allow_dirty=True,
+    )
+
+    assert swap_happened
+    assert result.sources == ()
+    rejected_pairs = [(item.path, item.rule) for item in result.rejected]
+    assert ("docs/target.md", "detection_error") in rejected_pairs
+    assert not any(rule == "token_assignment" for _, rule in rejected_pairs)
+    assert "AKIA" not in repr(result)
+    assert "outsidecredential" not in repr(result)
+    assert (outside_dir / "target.md").as_uri() not in repr(result)
+
+
 def test_dirty_source_rejects_mutation_between_stable_read_and_uri_derivation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -298,9 +342,9 @@ def test_dirty_source_rejects_mutation_between_stable_read_and_uri_derivation(
     real_read = source_discovery._read_dirty_source_bytes
     mutation_happened = False
 
-    def mutate_after_stable_read(path: Path) -> Any:
+    def mutate_after_stable_read(root: Path, path: Path) -> Any:
         nonlocal mutation_happened
-        content = real_read(path)
+        content = real_read(root, path)
         path.write_text(changed_text, encoding="utf-8")
         mutation_happened = True
         return content
