@@ -231,15 +231,32 @@ class _StoreFakeClient:
         self.queries = []
         self.query_results = list(query_results)
         self.inserts = []
+        self.loads = []
 
     def query(self, sql, job_config=None):
         self.queries.append((sql, job_config))
         rows = self.query_results.pop(0) if self.query_results else []
         return _FakeJob(rows)
 
-    def insert_rows_json(self, table, rows, row_ids):
-        self.inserts.append((table, rows, row_ids))
-        return []
+    def get_table(self, table):
+        # Minimal stand-in: the production load path reads `.schema` to hand the
+        # load job the destination schema. Return a real SchemaField list so the
+        # actual LoadJobConfig accepts it.
+        from google.cloud import bigquery as _bq
+
+        class _T:
+            schema = [_bq.SchemaField("chunk_id", "STRING")]
+
+        return _T()
+
+    def load_table_from_json(self, rows, table, job_config=None):
+        # A load job appends all rows at once (no streaming buffer). Record the
+        # same (table, rows, row_ids) shape prior assertions expect; row_ids are
+        # the chunk ids for identity/dedup accounting.
+        row_ids = [row["chunk_id"] for row in rows]
+        self.inserts.append((table, list(rows), row_ids))
+        self.loads.append((table, list(rows), job_config))
+        return _FakeJob([])
 
 
 class _LifecycleFakeClient(_StoreFakeClient):
@@ -539,10 +556,9 @@ def test_insert_chunks_writes_denormalized_source_fields(monkeypatch):
     assert rows[0]["relative_path"] == "pkg/mod.py"
 
 
-def test_insert_chunks_serializes_metadata_as_json_string(monkeypatch):
-    # BigQuery JSON columns received via the streaming insert API
-    # (insert_rows_json) must be a JSON-encoded string, not a Python dict.
-    # A dict is rejected server-side with "metadata is not a record".
+def test_insert_chunks_writes_metadata_as_json_object(monkeypatch):
+    # A load job writes the JSON column from the JSON object directly (a dict);
+    # a json.dumps string would double-encode it into a JSON string value.
     chunk = _chunk(metadata={"kind": "paragraph", "nested": {"a": 1}})
     client = _StoreFakeClient()
     monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
@@ -558,12 +574,10 @@ def test_insert_chunks_serializes_metadata_as_json_string(monkeypatch):
     )
 
     _table, rows, _row_ids = client.inserts[0]
-    metadata_field = rows[0]["metadata"]
-    assert isinstance(metadata_field, str)
-    assert json.loads(metadata_field) == {"kind": "paragraph", "nested": {"a": 1}}
+    assert rows[0]["metadata"] == {"kind": "paragraph", "nested": {"a": 1}}
 
 
-def test_insert_chunks_serializes_absent_metadata_as_json_object_string(monkeypatch):
+def test_insert_chunks_writes_absent_metadata_as_empty_object(monkeypatch):
     chunk = _chunk()
     chunk.pop("metadata", None)
     client = _StoreFakeClient()
@@ -580,13 +594,14 @@ def test_insert_chunks_serializes_absent_metadata_as_json_object_string(monkeypa
     )
 
     _table, rows, _row_ids = client.inserts[0]
-    assert isinstance(rows[0]["metadata"], str)
-    assert json.loads(rows[0]["metadata"]) == {}
+    assert rows[0]["metadata"] == {}
 
 
-def test_insert_chunks_splits_into_bounded_row_count_batches(monkeypatch):
-    row_cap = bigquery_store._MAX_INSERT_ROWS
-    count = row_cap * 2 + 1
+def test_insert_chunks_loads_all_rows_in_one_load_job(monkeypatch):
+    # Load jobs (not streaming inserts) write straight to managed storage so the
+    # revision-activation DML in finalize_source_revision is not blocked by the
+    # streaming buffer. A single load appends every row in order with no drops.
+    count = 1001
     chunks = [_chunk(chunk_id=f"chunk-{i}", ordinal=i) for i in range(count)]
     client = _StoreFakeClient()
     monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
@@ -602,47 +617,12 @@ def test_insert_chunks_splits_into_bounded_row_count_batches(monkeypatch):
     )
 
     assert inserted == count
-    assert len(client.inserts) == 3
-    assert all(len(rows) <= row_cap for _table, rows, _ids in client.inserts)
-    # Every batch's row_ids track its own rows, and the whole insert is an
-    # exact, order-preserving partition of the input with no drops/duplicates.
-    for _table, rows, row_ids in client.inserts:
-        assert row_ids == [row["chunk_id"] for row in rows]
-    flat_rows = [row["chunk_id"] for _t, rows, _i in client.inserts for row in rows]
-    flat_ids = [row_id for _t, _r, row_ids in client.inserts for row_id in row_ids]
-    expected = [chunk["chunk_id"] for chunk in chunks]
-    assert flat_rows == expected
-    assert flat_ids == expected
-
-
-def test_insert_chunks_splits_into_bounded_byte_size_batches(monkeypatch):
-    # Force the byte cap, not the row cap, to be the binding constraint so the
-    # split proves payloads stay under the client's insertAll size limit.
-    monkeypatch.setattr(bigquery_store, "_MAX_INSERT_BYTES", 2000)
-    monkeypatch.setattr(bigquery_store, "_MAX_INSERT_ROWS", 10_000)
-    chunks = [_chunk(chunk_id=f"chunk-{i}", ordinal=i, text="x" * 500) for i in range(10)]
-    client = _StoreFakeClient()
-    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
-    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
-
-    inserted = bigquery_store.insert_chunks(
-        chunks,
-        user_id="user-1",
-        agent_name="hermes",
-        embedding_model="test-embedding-model",
-        embedding_dimensions=3,
-        cfg=cfg,
-    )
-
-    assert inserted == len(chunks)
-    assert len(client.inserts) > 1
-    for _table, rows, row_ids in client.inserts:
-        payload = sum(bigquery_store._row_json_bytes(row) for row in rows)
-        # A batch may exceed the cap only when it is a single unsplittable row.
-        assert payload <= bigquery_store._MAX_INSERT_BYTES or len(rows) == 1
-        assert row_ids == [row["chunk_id"] for row in rows]
-    flat_ids = [row_id for _t, _r, row_ids in client.inserts for row_id in row_ids]
-    assert flat_ids == [chunk["chunk_id"] for chunk in chunks]
+    # Exactly one load job carries the whole insert, order-preserving, no dupes.
+    assert len(client.loads) == 1
+    _table, rows, _job_config = client.loads[0]
+    assert [row["chunk_id"] for row in rows] == [c["chunk_id"] for c in chunks]
+    # Rows are written inactive; activation happens later in finalize.
+    assert all(row["is_active"] is False for row in rows)
 
 
 def test_insert_chunks_rejects_duplicate_chunk_ids_before_client(monkeypatch):

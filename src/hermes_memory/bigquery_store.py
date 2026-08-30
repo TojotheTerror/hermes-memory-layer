@@ -10,19 +10,6 @@ from numbers import Real
 
 from .config import HermesMemoryConfig, load_config
 
-# BigQuery's streaming insertAll caps a single request at ~10 MB and a bounded
-# row count. Split large chunk inserts so no request exceeds either limit; the
-# byte budget stays under 10 MB with headroom for request envelope overhead.
-_MAX_INSERT_ROWS = 500
-_MAX_INSERT_BYTES = 9_000_000
-
-
-def _row_json_bytes(row: dict) -> int:
-    """Estimate a row's serialized insertAll payload size in bytes."""
-    import json as _json
-
-    return len(_json.dumps(row, default=str, ensure_ascii=False).encode("utf-8"))
-
 
 # DDL lives in bigquery/*.sql for review; Python helpers are thin wrappers
 # so `bq` CLI or Terraform can also apply them without Python.
@@ -467,7 +454,6 @@ def insert_chunks(
         raise RuntimeError("BigQuery client unavailable")
 
     from datetime import datetime, timezone
-    import json as _json
 
     timestamp = datetime.now(timezone.utc).isoformat()
     rows = [
@@ -492,7 +478,12 @@ def insert_chunks(
             "embedding": list(chunk["embedding"]),
             "embedding_model": embedding_model,
             "embedding_dimensions": embedding_dimensions,
-            "metadata": _json.dumps(chunk.get("metadata") or {}),
+            # JSON column via a load job takes the JSON object directly (a dict),
+            # not a json.dumps string. Load jobs also write straight to managed
+            # storage rather than the streaming buffer, so the subsequent DML
+            # activation in finalize_source_revision is not blocked by
+            # "UPDATE would affect rows in the streaming buffer".
+            "metadata": chunk.get("metadata") or {},
             "is_active": False,
             "created_at": timestamp,
             "updated_at": timestamp,
@@ -500,38 +491,26 @@ def insert_chunks(
         for chunk in chunks
     ]
     table = f"{cfg.project}.{cfg.bq_dataset}.document_chunks"
-    inserted = 0
-    for batch_rows, batch_ids in _batched_insert_rows(rows):
-        errors = client.insert_rows_json(table, batch_rows, row_ids=batch_ids)
-        if errors:
-            raise RuntimeError(f"BigQuery chunk insert failed: {errors}")
-        inserted += len(batch_rows)
-    return inserted
+    _load_chunk_rows(client, table, rows)
+    return len(rows)
 
 
-def _batched_insert_rows(rows: list[dict]):
-    """Yield (rows, row_ids) batches bounded by row count and payload bytes.
+def _load_chunk_rows(client, table: str, rows: list[dict]) -> None:
+    """Append inactive chunk rows via a load job (not the streaming buffer).
 
-    Each batch stays within `_MAX_INSERT_ROWS` and `_MAX_INSERT_BYTES`; a single
-    row that alone exceeds the byte cap is emitted as its own batch rather than
-    dropped, so the yielded batches always form an exact, order-preserving
-    partition of `rows` with no drops or duplicates.
+    A load job writes to managed storage immediately, so a following DML
+    UPDATE/DELETE (revision activation) is permitted; streaming inserts are
+    not, because their rows sit in a streaming buffer that DML cannot touch
+    for up to ~90 minutes.
     """
-    batch: list[dict] = []
-    batch_ids: list[str] = []
-    batch_bytes = 0
-    for row in rows:
-        row_bytes = _row_json_bytes(row)
-        if batch and (
-            len(batch) >= _MAX_INSERT_ROWS or batch_bytes + row_bytes > _MAX_INSERT_BYTES
-        ):
-            yield batch, batch_ids
-            batch, batch_ids, batch_bytes = [], [], 0
-        batch.append(row)
-        batch_ids.append(row["chunk_id"])
-        batch_bytes += row_bytes
-    if batch:
-        yield batch, batch_ids
+    from google.cloud import bigquery as _bq
+
+    job_config = _bq.LoadJobConfig(
+        schema=client.get_table(table).schema,
+        write_disposition=_bq.WriteDisposition.WRITE_APPEND,
+        source_format=_bq.SourceFormat.NEWLINE_DELIMITED_JSON,
+    )
+    client.load_table_from_json(rows, table, job_config=job_config).result()
 
 
 def finalize_source_revision(
