@@ -68,6 +68,17 @@ real APPROVE — no self-approval, no merge on green CI alone.
   embeddings, `search-docs` returns ranked COSINE results with line-anchored
   citations. Total spend ~$0.0015. Pilot artifacts: BigQuery tables live;
   pilot vault ~/Vaults/_pilot_hermes_docs (2 approved notes, copies).
+- 2026-08-30: Load-job fix (f1daf6f) INDEPENDENTLY VALIDATED — dual APPROVE
+  (quality/security + spec-compliance) at HEAD 050d0f7. Spec review noted the
+  load job is all-or-nothing per call (stronger than streaming) and WRITE_APPEND
+  preserves the active revision (restart-safe). Task 20 pilot fully closed.
+  KNOWN NON-BLOCKING FOLLOW-UP (backlog, not a release blocker): the load-job
+  path lost streaming row_ids dedup, so a source inserted-but-not-finalized then
+  retried could accumulate physical DUPLICATE INACTIVE rows. These NEVER
+  activate/retrieve (finalize's completeness-ASSERT + activate-by-id gate what
+  goes live), so it is storage hygiene only. Harden later via a
+  `DELETE WHERE source_id=@sid AND is_active=FALSE` (or dedup pass) before the
+  load — deferred to keep the data-path change reviewed-and-minimal.
 
 ## Integration reconciliation clusters
 - **Chunking:** Tasks 4 (integrated) / 6 / 14 — cherry-pick only the isolated
