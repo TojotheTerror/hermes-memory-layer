@@ -39,6 +39,78 @@ def _save_obsidian_manifest(manifest: dict) -> None:
     p.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
+def ingest_obsidian_documents(
+    vault_roots,
+    *,
+    cfg: HermesMemoryConfig | None = None,
+    user_id: str,
+    agent_name: str = "hermes",
+    embedding_client,
+    state_reader: Callable[..., dict | None] | None = None,
+    insert_chunks: Callable[..., int] | None = None,
+    finalize_source_revision: Callable[..., None] | None = None,
+    semantic_gateway=None,
+    memory_bank_client: Callable[..., object] | None = None,
+    promote_to_memory_bank: bool = False,
+    memory_bank_name: str | None = None,
+    manifest_loader: Callable[[], dict] | None = None,
+    policy=None,
+):
+    """Ingest Obsidian notes as documents with BigQuery document_sources authority.
+
+    Skip decisions are made ONLY against the BigQuery ``document_sources`` state
+    (via ``state_reader``, defaulting to ``bigquery_store.get_source_state``). The
+    v1 local ``obsidian_ingest_manifest.json`` is read exactly once, purely to
+    report prior legacy state in the report — it never gates or skips a document
+    write, and the manifest file is left untouched.
+    """
+
+    from . import bigquery_store
+    from .ingestion import apply_ingestion_plan, plan_obsidian_ingestion
+
+    cfg = cfg or load_config()
+
+    # One-time, report-only read of the legacy v1 manifest. NEVER used to gate.
+    loader = manifest_loader or _load_obsidian_manifest
+    legacy_manifest = loader() or {}
+    legacy_manifest_entries = len(legacy_manifest)
+
+    if state_reader is None:
+
+        def _default_state_reader(source_id, *, user_id, agent_name):
+            return bigquery_store.get_source_state(
+                source_id, user_id=user_id, agent_name=agent_name, cfg=cfg
+            )
+
+        state_reader = _default_state_reader
+
+    insert_chunks = insert_chunks or bigquery_store.insert_chunks
+    finalize_source_revision = finalize_source_revision or bigquery_store.finalize_source_revision
+
+    plan = plan_obsidian_ingestion(
+        vault_roots,
+        cfg=cfg,
+        user_id=user_id,
+        agent_name=agent_name,
+        state_reader=state_reader,
+        policy=policy,
+    )
+    return apply_ingestion_plan(
+        plan,
+        cfg=cfg,
+        user_id=user_id,
+        agent_name=agent_name,
+        embedding_client=embedding_client,
+        insert_chunks=insert_chunks,
+        finalize_source_revision=finalize_source_revision,
+        semantic_gateway=semantic_gateway,
+        memory_bank_client=memory_bank_client,
+        promote_to_memory_bank=promote_to_memory_bank,
+        memory_bank_name=memory_bank_name,
+        legacy_manifest_entries=legacy_manifest_entries,
+    )
+
+
 DEFAULT_OBSIDIAN_VAULTS = [
     "~/Vaults/Fully Experimental",
     "~/Vaults/Hermes_Agent",
