@@ -1,7 +1,37 @@
 name: gcp_memory_bank
-version: "1.0.0"
-description: "GCP Agent Platform Memory Bank + BigQuery — persistent memory via Vertex AI Memory Bank (semantic) and BigQuery (analytics/audit)."
+version: "1.1.0"
+description: "GCP Agent Platform Memory Bank + BigQuery — persistent memory via Vertex AI Memory Bank (semantic) and BigQuery (analytics/audit), plus a separate citation-bearing document retrieval channel that fails open to Memory Bank."
+# 1.1.0: plugin gained a separate document prefetch channel (citation-bearing
+# BigQuery chunks) and its config fields (document_retrieval_enabled,
+# document_top_k, document_context_char_limit). Same single installation path as
+# before — no second install method. The document channel is enabled by default
+# ONLY when the document tables are available, and always fails open to Memory
+# Bank. See docs/semantic-ingestion.md (rollback: document_retrieval_enabled=false).
 external_dependencies:
   - name: hermes-memory-layer
     install: "pip install -e ~/hermes-memory-layer"
     check: "python -c 'import hermes_memory'"
+config:
+  # All optional; documented here for discoverability. Defaults live in the
+  # provider. Set under memory.gcp_memory_bank in ~/.hermes/config.yaml.
+  - key: user_id
+    description: "Memory scope user_id (matches Memory Bank scope)"
+    default: "tojo"
+  - key: agent_name
+    description: "Memory scope agent_name (matches Memory Bank scope)"
+    default: "hermes"
+  - key: top_k
+    description: "Memories to retrieve per turn"
+    default: "5"
+  - key: prefetch_timeout
+    description: "Max seconds to block turn start on recall"
+    default: "8"
+  - key: document_retrieval_enabled
+    description: "Retrieve citation-bearing document chunks as a separate channel that fails open to Memory Bank (default: enabled only when document tables exist). Set false to roll back document retrieval without touching Memory Bank."
+    default: "auto (enabled when document tables available)"
+  - key: document_top_k
+    description: "Document chunks to retrieve per turn"
+    default: "4"
+  - key: document_context_char_limit
+    description: "Max total characters of document context injected per turn"
+    default: "8000"
