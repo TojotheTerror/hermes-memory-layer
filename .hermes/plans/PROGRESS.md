@@ -2,7 +2,7 @@
 
 **Repo:** `hermes-memory-layer`
 **Integration branch:** `feat/vertex-semantic-ingestion`
-**Integration HEAD:** `79ec231` (Tasks 1–11, 13, 14, 18 integrated; 653 tests green)
+**Integration HEAD:** `2b885d6` (Tasks 1–14, 16, 17, 18 integrated; 694 tests green)
 **Governing plan:** `.hermes/plans/2026-08-29_121924-vertex-semantic-ingestion.md`
 **Last updated:** 2026-08-30
 
