@@ -2,7 +2,7 @@
 
 **Repo:** `hermes-memory-layer`
 **Integration branch:** `feat/vertex-semantic-ingestion`
-**Integration HEAD:** `2f5d38e` (Tasks 1–10, 13, 14, 18 integrated; 637 tests green)
+**Integration HEAD:** `79ec231` (Tasks 1–11, 13, 14, 18 integrated; 653 tests green)
 **Governing plan:** `.hermes/plans/2026-08-29_121924-vertex-semantic-ingestion.md`
 **Last updated:** 2026-08-30
 
@@ -36,11 +36,11 @@ real APPROVE — no self-approval, no merge on green CI alone.
 | 13 | Git discovery/stable citations | INTEGRATED | in `fa65a69` (source cluster) |
 | 14 | Symbol-aware code units | INTEGRATED | in `fa65a69` (chunking cluster) |
 | 18 | Retrieval-quality evaluation gate | INTEGRATED | in `ac0ac09` (`ed47e25`) |
-| 11 | Incremental Obsidian ingestion slice | IN REVIEW (spec + quality) | `feat/task11-obsidian-ingestion` @ `057d0de` |
-| 12 | Preview-first Obsidian CLI | PENDING | — |
-| 15 | ingest-repo / search-docs commands | PENDING | — |
-| 16 | Provenance-honest Memory Bank promotion | PENDING | — |
-| 17 | Citation-aware retrieval into prefetch | PENDING | — |
+| 11 | Incremental Obsidian ingestion slice | INTEGRATED | in `79ec231` (`057d0de`) |
+| 12 | Preview-first Obsidian CLI | IN PROGRESS (TDD) | touches `cli.py` |
+| 15 | ingest-repo / search-docs commands | HELD (needs 12's cli.py) | — |
+| 16 | Provenance-honest Memory Bank promotion | IN PROGRESS (TDD) | `ingestion.py`+`memory_bank.py` |
+| 17 | Citation-aware retrieval into prefetch | IN PROGRESS (TDD) | `hermes_bridge.py`+plugin |
 | 19 | Setup, docs, rollback guidance | PENDING | — |
 | 20 | Live GCP pilots + fleet verification | GATED (user go-ahead) | — |
 | 21 | Independent review, PR/CI, merge, release tag | GATED (user go-ahead) | — |
