@@ -70,6 +70,13 @@ class SourceDocument:
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", _deep_freeze(self.metadata))
 
+    def citation(self, start_line: int, end_line: int) -> str:
+        """Return a stable inclusive line citation for this source."""
+
+        if start_line < 1 or end_line < start_line:
+            raise ValueError("citation lines must be positive and ordered")
+        return f"{self.source_uri}#L{start_line}-L{end_line}"
+
 
 @dataclass(frozen=True)
 class AtomicUnit:
@@ -79,6 +86,7 @@ class AtomicUnit:
     start_line: int
     end_line: int
     token_estimate: int
+    section_start_line: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "heading_path", tuple(self.heading_path))
