@@ -467,6 +467,7 @@ def insert_chunks(
         raise RuntimeError("BigQuery client unavailable")
 
     from datetime import datetime, timezone
+    import json as _json
 
     timestamp = datetime.now(timezone.utc).isoformat()
     rows = [
@@ -491,7 +492,7 @@ def insert_chunks(
             "embedding": list(chunk["embedding"]),
             "embedding_model": embedding_model,
             "embedding_dimensions": embedding_dimensions,
-            "metadata": chunk.get("metadata") or {},
+            "metadata": _json.dumps(chunk.get("metadata") or {}),
             "is_active": False,
             "created_at": timestamp,
             "updated_at": timestamp,

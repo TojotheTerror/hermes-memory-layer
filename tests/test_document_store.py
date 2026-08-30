@@ -539,6 +539,51 @@ def test_insert_chunks_writes_denormalized_source_fields(monkeypatch):
     assert rows[0]["relative_path"] == "pkg/mod.py"
 
 
+def test_insert_chunks_serializes_metadata_as_json_string(monkeypatch):
+    # BigQuery JSON columns received via the streaming insert API
+    # (insert_rows_json) must be a JSON-encoded string, not a Python dict.
+    # A dict is rejected server-side with "metadata is not a record".
+    chunk = _chunk(metadata={"kind": "paragraph", "nested": {"a": 1}})
+    client = _StoreFakeClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    bigquery_store.insert_chunks(
+        [chunk],
+        user_id="user-1",
+        agent_name="hermes",
+        embedding_model="test-embedding-model",
+        embedding_dimensions=3,
+        cfg=cfg,
+    )
+
+    _table, rows, _row_ids = client.inserts[0]
+    metadata_field = rows[0]["metadata"]
+    assert isinstance(metadata_field, str)
+    assert json.loads(metadata_field) == {"kind": "paragraph", "nested": {"a": 1}}
+
+
+def test_insert_chunks_serializes_absent_metadata_as_json_object_string(monkeypatch):
+    chunk = _chunk()
+    chunk.pop("metadata", None)
+    client = _StoreFakeClient()
+    monkeypatch.setattr(bigquery_store, "_bq_client", lambda cfg: client)
+    cfg = HermesMemoryConfig(project="test-project", bq_dataset="test_dataset")
+
+    bigquery_store.insert_chunks(
+        [chunk],
+        user_id="user-1",
+        agent_name="hermes",
+        embedding_model="test-embedding-model",
+        embedding_dimensions=3,
+        cfg=cfg,
+    )
+
+    _table, rows, _row_ids = client.inserts[0]
+    assert isinstance(rows[0]["metadata"], str)
+    assert json.loads(rows[0]["metadata"]) == {}
+
+
 def test_insert_chunks_splits_into_bounded_row_count_batches(monkeypatch):
     row_cap = bigquery_store._MAX_INSERT_ROWS
     count = row_cap * 2 + 1
