@@ -39,14 +39,51 @@ import threading
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
-from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
 _GLYPH = "\u2601\ufe0f"  # cloud, to distinguish from the generic brain glyph
 _DEFAULT_PREFETCH_TIMEOUT = 8.0
 _DEFAULT_TOP_K = 5
+_DEFAULT_DOCUMENT_TOP_K = 4
+_DEFAULT_DOCUMENT_CONTEXT_CHAR_LIMIT = 8_000
 _MIN_SYNC_LEN = 8  # skip near-empty turns
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _coerce_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _document_tables_available() -> bool:
+    """Import-only probe: is the document retrieval backend integrated?
+
+    No network call and no client construction — this only checks that the
+    Task 5/9 document store surface (search + chunk DDL) is importable, which
+    is the signal that document tables are provisioned for this deployment.
+    Any import failure means documents are cleanly disabled by default.
+    """
+    try:
+        from hermes_memory.bigquery_store import (  # noqa: F401
+            DDL_DOCUMENT_CHUNKS,
+            search_document_chunks,
+        )
+    except Exception:
+        return False
+    return True
 
 
 def _load_plugin_config() -> Dict[str, Any]:
@@ -70,8 +107,27 @@ class GcpMemoryBankProvider(MemoryProvider):
         self._config = dict(config) if config is not None else _load_plugin_config()
         self._user_id = str(self._config.get("user_id", "tojo"))
         self._agent_name = str(self._config.get("agent_name", "hermes"))
-        self._prefetch_timeout = float(self._config.get("prefetch_timeout", _DEFAULT_PREFETCH_TIMEOUT))
+        self._prefetch_timeout = float(
+            self._config.get("prefetch_timeout", _DEFAULT_PREFETCH_TIMEOUT)
+        )
         self._top_k = int(self._config.get("top_k", _DEFAULT_TOP_K))
+
+        # Document channel config. Default enabled ONLY when document tables are
+        # available; an explicit config value always wins. This is a separate
+        # channel from Memory Bank recall and never alters it.
+        if "document_retrieval_enabled" in self._config:
+            self._document_retrieval_enabled = _coerce_bool(
+                self._config.get("document_retrieval_enabled"), False
+            )
+        else:
+            self._document_retrieval_enabled = _document_tables_available()
+        self._document_top_k = _coerce_positive_int(
+            self._config.get("document_top_k"), _DEFAULT_DOCUMENT_TOP_K
+        )
+        self._document_context_char_limit = _coerce_positive_int(
+            self._config.get("document_context_char_limit"),
+            _DEFAULT_DOCUMENT_CONTEXT_CHAR_LIMIT,
+        )
 
         self._bridge = None
         self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
@@ -116,9 +172,11 @@ class GcpMemoryBankProvider(MemoryProvider):
                     logger.debug(
                         "gcp_memory_bank: hermes_memory.config miss (attempt %d), "
                         "invalidating caches and retrying: %s",
-                        attempt, e,
+                        attempt,
+                        e,
                     )
                     import importlib
+
                     importlib.invalidate_caches()
                     continue
                 logger.debug("gcp_memory_bank: config still unavailable after retry: %s", e)
@@ -149,17 +207,39 @@ class GcpMemoryBankProvider(MemoryProvider):
         try:
             from hermes_memory.hermes_bridge import HermesBridge
 
-            self._bridge = HermesBridge()
+            query_embedder = self._build_query_embedder()
+            self._bridge = HermesBridge(query_embedder=query_embedder)
             self._executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=2, thread_name_prefix="gcp-memory-bank"
             )
             logger.info(
-                "gcp_memory_bank initialized: engine=%s scope={user_id:%s, agent_name:%s}",
-                self._bridge.memory_bank_name, self._user_id, self._agent_name,
+                "gcp_memory_bank initialized: engine=%s scope={user_id:%s, agent_name:%s} "
+                "document_retrieval=%s",
+                self._bridge.memory_bank_name,
+                self._user_id,
+                self._agent_name,
+                self._document_retrieval_enabled,
             )
         except Exception as e:
             logger.warning("gcp_memory_bank: initialize failed: %s", e)
             self._bridge = None
+
+    def _build_query_embedder(self):
+        """Build the live RETRIEVAL_QUERY embedder, or None to leave documents
+        inert. Only invoked from initialize() (the primary-context lifecycle
+        hook), never at import time. Returns None on any failure so Memory Bank
+        recall is never blocked by document wiring.
+        """
+        if not self._document_retrieval_enabled:
+            return None
+        try:
+            from hermes_memory.hermes_bridge import _default_query_embedder
+            from hermes_memory.config import load_config as load_hm_config
+
+            return _default_query_embedder(load_hm_config())
+        except Exception as e:
+            logger.debug("gcp_memory_bank: query embedder unavailable: %s", e)
+            return None
 
     def system_prompt_block(self) -> str:
         if not self._bridge:
@@ -189,6 +269,9 @@ class GcpMemoryBankProvider(MemoryProvider):
                 query=query,
                 top_k=self._top_k,
                 agent_name=self._agent_name,
+                document_retrieval_enabled=self._document_retrieval_enabled,
+                document_top_k=self._document_top_k,
+                document_context_char_limit=self._document_context_char_limit,
             )
             result = future.result(timeout=self._prefetch_timeout)
         except concurrent.futures.TimeoutError:
@@ -199,14 +282,43 @@ class GcpMemoryBankProvider(MemoryProvider):
             return ""
 
         merged = result.get("merged") or []
-        if not merged:
+        document_hits = result.get("document_hits") or []
+
+        fact_lines = [f"- {m['fact']}" for m in merged if m.get("fact")]
+        doc_lines = self._render_document_lines(document_hits)
+
+        if not fact_lines and not doc_lines:
             return ""
-        self._last_recall_count = len(merged)
+
+        self._last_recall_count = len(merged) + len(document_hits)
         self._last_recall_had_content = True
-        lines = [f"- {m['fact']}" for m in merged if m.get("fact")]
-        if not lines:
-            return ""
-        return "## GCP Memory Bank\n" + "\n".join(lines)
+
+        sections: list[str] = ["## GCP Memory Bank"]
+        if fact_lines:
+            sections.append("\n".join(fact_lines))
+        if doc_lines:
+            sections.append("### Documents\n" + "\n".join(doc_lines))
+        return "\n".join(sections)
+
+    @staticmethod
+    def _render_document_lines(document_hits: List[Dict[str, Any]]) -> List[str]:
+        """Render document hits as bullet lines, retaining stable citations.
+
+        Order is preserved from the bridge so citations are stable across
+        identical prefetch() calls. Bodies are included as recall context but
+        each line keeps its explicit source citation.
+        """
+        lines: list[str] = []
+        for hit in document_hits:
+            content = (hit.get("content") or "").strip()
+            citation = (hit.get("citation") or "").strip()
+            if not content and not citation:
+                continue
+            if citation:
+                lines.append(f"- {content} [{citation}]")
+            else:
+                lines.append(f"- {content}")
+        return lines
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """No-op: prefetch() runs synchronously (bounded) at turn start."""
@@ -214,7 +326,9 @@ class GcpMemoryBankProvider(MemoryProvider):
     def recall_status(self) -> Optional[RecallStatus]:
         if not self._last_recall_had_content:
             return None
-        return RecallStatus(provider_label="GCP Memory Bank", count=self._last_recall_count, glyph=_GLYPH)
+        return RecallStatus(
+            provider_label="GCP Memory Bank", count=self._last_recall_count, glyph=_GLYPH
+        )
 
     # -- auto-ingestion -----------------------------------------------------
 
@@ -315,6 +429,24 @@ class GcpMemoryBankProvider(MemoryProvider):
                 "description": "Max seconds to block turn start on recall",
                 "default": "8",
             },
+            {
+                "key": "document_retrieval_enabled",
+                "description": (
+                    "Retrieve citation-bearing document chunks as a separate "
+                    "channel (default: enabled only when document tables exist)"
+                ),
+                "default": str(_document_tables_available()).lower(),
+            },
+            {
+                "key": "document_top_k",
+                "description": "Document chunks to retrieve per turn",
+                "default": str(_DEFAULT_DOCUMENT_TOP_K),
+            },
+            {
+                "key": "document_context_char_limit",
+                "description": "Max total characters of document context per turn",
+                "default": str(_DEFAULT_DOCUMENT_CONTEXT_CHAR_LIMIT),
+            },
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -338,6 +470,7 @@ class GcpMemoryBankProvider(MemoryProvider):
 # ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
+
 
 def register(ctx) -> None:
     """Register the GCP Memory Bank provider with the plugin system."""

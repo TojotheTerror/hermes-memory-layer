@@ -239,6 +239,59 @@ def _retrieve_bigquery_memories(user_id: str, *, top_k: int, cfg: HermesMemoryCo
     return [{"fact": row["fact"], "source": "bigquery", "raw": dict(row)} for row in rows]
 
 
+def _default_query_embedder(cfg: HermesMemoryConfig):
+    """Build a live RETRIEVAL_QUERY embedder callable, or None when offline.
+
+    Returns a ``callable(text) -> EmbeddingResult`` or ``None``. Constructing
+    the SDK client is deferred here so importing this module never touches the
+    network, and unit tests inject their own embedder instead of ever reaching
+    this factory.
+    """
+    from .config import get_vertex_client
+
+    client = get_vertex_client(cfg.project, cfg.location)
+    if client is None:
+        return None
+    from .embeddings import VertexEmbeddingClient
+
+    embedder = VertexEmbeddingClient(
+        client=client,
+        model=cfg.document_embedding_model,
+        dimensions=cfg.document_embedding_dimensions,
+        task_type="RETRIEVAL_QUERY",
+    )
+    return embedder.embed
+
+
+def _default_document_search(embedding, **kwargs):
+    """Default document channel search — delegates to bigquery_store."""
+    from .bigquery_store import search_document_chunks
+
+    return search_document_chunks(embedding, **kwargs)
+
+
+def _document_hit_to_dict(hit) -> dict:
+    """Project a DocumentChunkSearchResult onto a citation-bearing channel dict.
+
+    Citations are ALWAYS retained. Content/embeddings are never printed.
+    """
+    return {
+        "citation": hit.citation,
+        "content": hit.content,
+        "contextual_content": hit.contextual_content,
+        "source_path": hit.source_path,
+        "heading_path": list(hit.heading_path),
+        "symbol": hit.symbol,
+        "start_line": hit.start_line,
+        "end_line": hit.end_line,
+        "chunk_id": hit.chunk_id,
+        "source_id": hit.source_id,
+        "corpus_id": hit.corpus_id,
+        "distance": hit.distance,
+        "origin": "document",
+    }
+
+
 class HermesBridge:
     """Offline-safe bridge between local Hermes and GCP memory layer."""
 
@@ -249,20 +302,41 @@ class HermesBridge:
         memory_bank_retriever: Callable[..., list[dict]] = retrieve_memories,
         bigquery_retriever: Callable[..., list[dict]] = _retrieve_bigquery_memories,
         local_memory_reader: Callable[..., list[dict]] = read_local_memories,
+        query_embedder: Callable[[str], Any] | None = None,
+        document_search: Callable[..., list] = _default_document_search,
     ):
         self.cfg = cfg or load_config()
         self._memory_bank_retriever = memory_bank_retriever
         self._bigquery_retriever = bigquery_retriever
         self._local_memory_reader = local_memory_reader
+        # Document retrieval is a SEPARATE channel. The query embedder is
+        # injected (by production wiring or tests). When None the document
+        # channel is simply inert — this class never constructs a live client.
+        self._query_embedder = query_embedder
+        self._document_search = document_search
 
     @property
     def memory_bank_name(self) -> str | None:
         return self.cfg.agent_engine_name
 
     def retrieve_context(
-        self, user_id: str, query: str, top_k: int = 8, agent_name: str = "hermes"
+        self,
+        user_id: str,
+        query: str,
+        top_k: int = 8,
+        agent_name: str = "hermes",
+        *,
+        document_retrieval_enabled: bool = True,
+        document_top_k: int | None = None,
+        document_context_char_limit: int | None = None,
     ) -> dict:
-        """Dual retrieval: Memory Bank semantic + BigQuery SQL (mock if offline)."""
+        """Dual retrieval: Memory Bank semantic + BigQuery SQL (mock if offline).
+
+        Document retrieval is a SEPARATE, citation-bearing channel merged by
+        field (``document_hits``), never flattened into the ``fact`` channel. It
+        fails open: any embedding or search error preserves Memory Bank recall
+        and the turn still returns.
+        """
         scope = {"user_id": user_id, "agent_name": agent_name}
         bank_hits: list[dict] = []
         if self.memory_bank_name:
@@ -312,15 +386,100 @@ class HermesBridge:
             if fact and fact.lower().strip() not in seen:
                 merged.append({"fact": fact, "origin": "local", "raw": lh})
 
+        # Document channel — SEPARATE from facts, citation-bearing, fail-open.
+        document_hits = self._retrieve_documents(
+            user_id,
+            query,
+            agent_name=agent_name,
+            enabled=document_retrieval_enabled,
+            document_top_k=document_top_k,
+            document_context_char_limit=document_context_char_limit,
+        )
+
         return {
             "query": query,
             "scope": scope,
             "memory_bank_hits": bank_hits,
             "bigquery_hits": bq_hits,
             "local_hits": local_hits,
+            "document_hits": document_hits,
             "merged": merged[:top_k],
             "prompt_context": "\n".join(f"- {m['fact']}" for m in merged[:top_k] if m.get("fact")),
         }
+
+    def _retrieve_documents(
+        self,
+        user_id: str,
+        query: str,
+        *,
+        agent_name: str,
+        enabled: bool,
+        document_top_k: int | None,
+        document_context_char_limit: int | None,
+    ) -> list[dict]:
+        """Citation-aware document channel. Embed ONCE, search, then enforce
+        ``document_top_k`` and ``document_context_char_limit`` before returning.
+
+        Fail-open contract: any embedding or search failure returns ``[]`` so
+        Memory Bank recall is preserved and the turn is never blocked. Never
+        prints bodies, credentials, or embeddings.
+        """
+        if not enabled:
+            return []
+
+        top_k = document_top_k if document_top_k is not None else self.cfg.document_top_k
+        char_limit = (
+            document_context_char_limit
+            if document_context_char_limit is not None
+            else self.cfg.document_context_char_limit
+        )
+        # Invalid bounds disable the channel rather than break the turn.
+        if type(top_k) is not int or top_k <= 0:
+            return []
+        if type(char_limit) is not int or char_limit <= 0:
+            return []
+
+        embedder = self._query_embedder
+        if embedder is None:
+            # No embedder wired (e.g. offline or unit isolation): document
+            # channel is inert. Memory Bank recall is unaffected.
+            return []
+
+        try:
+            # Embed the query exactly ONCE for document retrieval.
+            embedded = embedder(query)
+            embedding = getattr(embedded, "values", embedded)
+            raw_hits = self._document_search(
+                embedding,
+                user_id=user_id,
+                agent_name=agent_name,
+                top_k=top_k,
+                cfg=self.cfg,
+            )
+        except Exception as e:
+            # Fail-open: preserve Memory Bank recall, never surface bodies.
+            print(f"[bridge] document retrieve failed: {e}")
+            return []
+
+        # Enforce top_k on the returned list (defence in depth) then the char
+        # budget, always retaining each hit's citation.
+        hits: list[dict] = []
+        used_chars = 0
+        for hit in raw_hits[:top_k]:
+            projected = _document_hit_to_dict(hit)
+            content_len = len(projected["content"])
+            if used_chars + content_len > char_limit:
+                remaining = char_limit - used_chars
+                if remaining <= 0:
+                    break
+                projected["content"] = projected["content"][:remaining]
+                projected["truncated"] = True
+                used_chars += remaining
+                hits.append(projected)
+                break
+            used_chars += content_len
+            hits.append(projected)
+        return hits
 
     def explicit_remember(
         self, user_id: str, fact: str, agent_name: str = "hermes", metadata: dict | None = None
