@@ -177,7 +177,13 @@ def parse_code_units(
     try:
         tree = ast.parse(normalized_text)
         compile(tree, "<code>", "exec")
-    except SyntaxError:
+    except (SyntaxError, RecursionError):
+        # SyntaxError: grammar-invalid or context-invalid source (e.g. a bare
+        # ``return`` outside a function, surfaced by compile()). RecursionError:
+        # grammar-valid but pathologically deep/chained source that ast.parse()
+        # accepts yet overflows the interpreter stack on parse or compile. Both
+        # are input pathologies, not programmer errors, so fall back to bounded
+        # deterministic generic windows that preserve every source character.
         return _generic_code_windows(text, max_tokens=max_tokens, max_lines=max_lines)
     symbols = _python_symbols(tree)
     if not symbols:

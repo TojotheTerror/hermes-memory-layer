@@ -1,3 +1,5 @@
+import ast
+import sys
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -151,6 +153,31 @@ def test_context_invalid_python_uses_complete_generic_fallback(statement: str):
     assert "".join(unit.text for unit in first) == source
     assert all(unit.symbol is None and unit.heading_path == () for unit in first)
     assert all(unit.token_estimate <= 6 for unit in first)
+    assert all(unit.end_line - unit.start_line + 1 <= 2 for unit in first)
+
+
+def test_pathological_python_compile_recursion_falls_back_without_losing_source():
+    # Grammar-valid deeply chained attribute access: ast.parse() accepts it but
+    # compile() overflows the interpreter stack with RecursionError. The parser
+    # must fall back to bounded deterministic generic windows, not abort chunking.
+    depth = 1500
+    source = "x" + ".a" * depth + "\n"
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    try:
+        tree = ast.parse(source)
+        with pytest.raises(RecursionError):
+            compile(tree, "<code>", "exec")
+
+        first = parse_code_units(source, language="python", max_tokens=8, max_lines=2)
+        second = parse_code_units(source, language="python", max_tokens=8, max_lines=2)
+    finally:
+        sys.setrecursionlimit(limit)
+
+    assert first == second
+    assert "".join(unit.text for unit in first) == source
+    assert all(unit.symbol is None and unit.heading_path == () for unit in first)
+    assert all(unit.token_estimate <= 8 for unit in first)
     assert all(unit.end_line - unit.start_line + 1 <= 2 for unit in first)
 
 
