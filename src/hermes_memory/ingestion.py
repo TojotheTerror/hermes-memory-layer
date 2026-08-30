@@ -102,13 +102,22 @@ class IngestionPlan:
 
 @dataclass(frozen=True)
 class SourceOutcome:
-    """Per-source apply outcome. Frozen, body-free."""
+    """Per-source apply outcome. Frozen, body-free.
+
+    ``promotion_status`` is truthful about Memory Bank promotion for THIS
+    source only: ``not_requested`` (promotion off), ``not_eligible`` (a
+    code/repository source without the explicit opt-in), ``complete`` (the
+    promotion call returned), or ``incomplete`` (promotion was requested and
+    eligible but could not be completed — the corpus stays valid regardless).
+    It never asserts which memories Memory Bank actually created.
+    """
 
     source_id: str
     relative_path: str
     status: str
     chunk_count: int
     token_count: int
+    promotion_status: str = "not_requested"
 
 
 @dataclass(frozen=True)
@@ -333,7 +342,14 @@ def _embedding_records(
     return records
 
 
-def _source_metadata(planned: PlannedSource) -> dict:
+def _source_metadata(planned: PlannedSource, *, promotion_requested: bool = False) -> dict:
+    metadata: dict = {}
+    if promotion_requested:
+        # Truthful scope: record only that promotion was REQUESTED for this
+        # source. We never write back a list of "facts" Memory Bank returned,
+        # because generation is asynchronous and does not hand back a
+        # one-to-one mapping from chunks to created memories.
+        metadata["memory_bank_promotion"] = "requested"
     return {
         "source_id": planned.source_id,
         "corpus_id": planned.corpus_id,
@@ -343,8 +359,76 @@ def _source_metadata(planned: PlannedSource) -> dict:
         "source_uri": planned.source_uri,
         "revision": planned.revision,
         "content_hash": planned.content_hash,
-        "metadata": {},
+        "metadata": metadata,
     }
+
+
+# Source kinds promoted to Memory Bank by default. Personal Markdown notes
+# (Obsidian) carry durable preferences worth distilling; code/repository
+# sources are kept as retrieval chunks unless the caller opts in explicitly.
+_DEFAULT_PROMOTION_KINDS = frozenset({_SOURCE_KIND})
+
+
+def _promotion_eligible(planned: PlannedSource, *, promote_code_sources: bool) -> bool:
+    """Whether a source may be promoted, given the code/repository opt-in."""
+
+    if planned.source_kind in _DEFAULT_PROMOTION_KINDS:
+        return True
+    return promote_code_sources
+
+
+def _promotion_payload(planned: PlannedSource, chunk: _PlannedChunk) -> str:
+    """Contextual promotion text: provenance + a durable-only instruction.
+
+    The payload names the source kind, path, and heading so generation can
+    ground provenance, and explicitly instructs it to keep only durable user
+    preferences/principles rather than transient document wording. The raw
+    passage follows the instruction — it is context for extraction, never an
+    asserted fact.
+    """
+
+    heading = " / ".join(chunk.heading_path) if chunk.heading_path else "(document root)"
+    return (
+        f"Source: {planned.source_kind} document at {planned.relative_path} "
+        f"(section: {heading}).\n"
+        "Instruction: from the passage below, retain only durable user "
+        "preferences and guiding principles as long-lived memory. Do NOT store "
+        "transient document wording, phrasing, or one-off details.\n\n"
+        f"Passage:\n{chunk.text}"
+    )
+
+
+def _promote_source(
+    planned: PlannedSource,
+    chunks: tuple[_PlannedChunk, ...],
+    *,
+    memory_bank_client,
+    memory_bank_name: str | None,
+    user_id: str,
+    agent_name: str,
+    cfg: HermesMemoryConfig,
+) -> str:
+    """Promote one already-written source; never raise, never roll back corpus.
+
+    Returns ``complete`` when the promotion call returns, or ``incomplete``
+    when promotion is unconfigured or the call fails. The BigQuery corpus was
+    inserted and finalized before this runs, so a failure here leaves it valid.
+    """
+
+    if memory_bank_client is None or not memory_bank_name:
+        # Requested and eligible but unconfigured: corpus is valid; incomplete.
+        return "incomplete"
+    texts = [_promotion_payload(planned, chunk) for chunk in chunks]
+    if not texts:
+        return "complete"
+    scope = {"user_id": user_id, "agent_name": agent_name}
+    try:
+        memory_bank_client(memory_bank_name, texts, scope, cfg=cfg)
+    except Exception:
+        # Surface as promotion-incomplete rather than raising so the valid
+        # document corpus is never rolled back.
+        return "incomplete"
+    return "complete"
 
 
 def apply_ingestion_plan(
@@ -359,6 +443,7 @@ def apply_ingestion_plan(
     semantic_gateway=None,
     memory_bank_client: Callable[..., object] | None = None,
     promote_to_memory_bank: bool = False,
+    promote_code_sources: bool = False,
     memory_bank_name: str | None = None,
     legacy_manifest_entries: int | None = None,
 ) -> IngestionReport:
@@ -367,9 +452,14 @@ def apply_ingestion_plan(
     Per discovered source the order is exactly: validate -> (optional) semantic
     boundary vectors when a ``semantic_gateway`` is provided -> final embedding
     vectors -> insert_chunks -> finalize_source_revision -> optional Memory Bank
-    promotion (only when ``promote_to_memory_bank`` is True). Skipped and rejected
-    sources touch no write path. Every dependency is injected, so no real client
-    is constructed and no network call is made.
+    promotion (only when ``promote_to_memory_bank`` is True). Promotion is
+    provenance-honest and restricted: Obsidian notes promote by default while
+    code/repository sources stay retrieval chunks unless ``promote_code_sources``
+    is also set. Promotion runs strictly AFTER the corpus for that source is
+    inserted and finalized, so a Memory Bank failure is surfaced as
+    promotion-incomplete without rolling back the valid corpus. Skipped and
+    rejected sources touch no write path. Every dependency is injected, so no
+    real client is constructed and no network call is made.
     """
 
     cfg = cfg or load_config()
@@ -414,6 +504,12 @@ def apply_ingestion_plan(
             embedding_dimensions=embedding_dimensions,
         )
 
+        # Decide promotion eligibility for THIS source before finalizing, so the
+        # requested-promotion marker can be recorded in its source metadata.
+        eligible = promote_to_memory_bank and _promotion_eligible(
+            planned, promote_code_sources=promote_code_sources
+        )
+
         # insert_chunks
         insert_chunks(
             records,
@@ -424,15 +520,31 @@ def apply_ingestion_plan(
             cfg=cfg,
         )
 
-        # finalize_source_revision
+        # finalize_source_revision (corpus becomes valid/active here)
         finalize_source_revision(
             planned.source_id,
             [c.chunk_id for c in chunks],
-            source=_source_metadata(planned),
+            source=_source_metadata(planned, promotion_requested=eligible),
             user_id=user_id,
             agent_name=agent_name,
             cfg=cfg,
         )
+
+        # optional Memory Bank promotion — strictly AFTER the corpus is valid.
+        if not promote_to_memory_bank:
+            source_promotion = "not_requested"
+        elif not eligible:
+            source_promotion = "not_eligible"
+        else:
+            source_promotion = _promote_source(
+                planned,
+                chunks,
+                memory_bank_client=memory_bank_client,
+                memory_bank_name=memory_bank_name,
+                user_id=user_id,
+                agent_name=agent_name,
+                cfg=cfg,
+            )
 
         discovered_outcomes.append(
             SourceOutcome(
@@ -441,20 +553,14 @@ def apply_ingestion_plan(
                 status="written",
                 chunk_count=len(chunks),
                 token_count=planned.token_count,
+                promotion_status=source_promotion,
             )
         )
 
-    # optional Memory Bank promotion (only when explicitly requested)
-    promotion_status = "not_requested"
-    if promote_to_memory_bank:
-        promotion_status = _promote(
-            plan,
-            memory_bank_client=memory_bank_client,
-            memory_bank_name=memory_bank_name,
-            user_id=user_id,
-            agent_name=agent_name,
-            cfg=cfg,
-        )
+    # Report-level promotion status is aggregated truthfully from per-source
+    # outcomes: incomplete if any eligible promotion could not complete,
+    # complete if at least one completed and none failed, otherwise not_requested.
+    promotion_status = _aggregate_promotion_status(promote_to_memory_bank, discovered_outcomes)
 
     skipped_outcomes = tuple(
         SourceOutcome(
@@ -480,28 +586,15 @@ def apply_ingestion_plan(
     )
 
 
-def _promote(
-    plan: IngestionPlan,
-    *,
-    memory_bank_client,
-    memory_bank_name: str | None,
-    user_id: str,
-    agent_name: str,
-    cfg: HermesMemoryConfig,
-) -> str:
-    """Promote written sources to Memory Bank; corpus stays valid on failure."""
+def _aggregate_promotion_status(promote_to_memory_bank: bool, outcomes: list[SourceOutcome]) -> str:
+    """Roll per-source promotion statuses up to a single truthful report status."""
 
-    if memory_bank_client is None or not memory_bank_name:
-        # Requested but unconfigured: corpus is already valid; mark incomplete.
+    if not promote_to_memory_bank:
+        return "not_requested"
+    statuses = {o.promotion_status for o in outcomes}
+    if "incomplete" in statuses:
         return "incomplete"
-    texts = [chunk.contextual_text for planned in plan.discovered for chunk in planned.chunks]
-    if not texts:
+    if "complete" in statuses:
         return "complete"
-    scope = {"user_id": user_id, "agent_name": agent_name}
-    try:
-        memory_bank_client(memory_bank_name, texts, scope, cfg=cfg)
-    except Exception:
-        # A promotion failure must leave the BigQuery corpus valid and be
-        # surfaced as promotion-incomplete rather than raised.
-        return "incomplete"
-    return "complete"
+    # Requested, but nothing was eligible to promote.
+    return "not_requested"
