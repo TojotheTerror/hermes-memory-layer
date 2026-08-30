@@ -72,15 +72,52 @@ See `examples/adk_agent_example.py` for full runtime deploy via `AdkApp` + `clie
 | `hermes_memory.memories` | Mirror of Memory Bank facts + embedding (REPEATED FLOAT), metadata JSON, TTL |
 | `hermes_memory.sessions` | Session event log (JSON), user_id, timestamps |
 | `hermes_memory.memory_revisions` | Audit trail from Memory Bank revisions API |
-| Views | `recent_memories`, `memory_stats`, `user_timeline` |
+| `hermes_memory.document_sources` | Citation-bearing document source identity + revision lifecycle (active/inactive) |
+| `hermes_memory.document_chunks` | Document chunks + retrieval embeddings (`gemini-embedding-001` @768) |
+| Views | `recent_memories`, `memory_stats`, `user_timeline`, `active_document_sources` |
 
 Vector search: `VECTOR_SEARCH(TABLE hermes_memory.memories, 'embedding', (SELECT text_embedding AS query ...), top_k=>8)`
+
+## Semantic document ingestion (Vertex-native)
+
+A **separate channel** from conversational Memory Bank: allowlisted Obsidian
+notes and clean Git repos are chunked (Markdown structural + Python
+symbol-aware via stdlib `ast`, no tree-sitter), embedded with Vertex
+`gemini-embedding-001` @768 dims (`auto_truncate=False`), and stored as
+**citation-bearing chunks** in BigQuery (`document_sources` / `document_chunks`,
+US). Retrieval is exact **brute-force COSINE** `VECTOR_SEARCH` — **no vector
+index**. The `gcp_memory_bank` plugin surfaces these as a document channel that
+**fails open** to Memory Bank.
+
+```bash
+hermes-memory init --project "$PROJECT_ID" --location us-central1 --bq-location US
+hermes-memory ingest-obsidian --user tojo --agent hermes --vault ~/Vaults/Hermes_Agent --limit 5 --json   # dry run
+hermes-memory ingest-obsidian --user tojo --agent hermes --vault ~/Vaults/Hermes_Agent --limit 5 --apply   # apply
+hermes-memory ingest-repo --user tojo --agent hermes --repo /path/to/checkout --ref HEAD --limit 20 --apply
+hermes-memory search-docs --user tojo --agent hermes --query "..." --top-k 5
+hermes-memory evaluate-docs --queries evaluation/queries.yaml --json evaluation-result.json
+```
+
+Channel separation: **Memory Bank = personal/conversational; BigQuery =
+citation-bearing documents.** Promotion of durable principles to Memory Bank is
+**opt-in** (`--promote-to-memory-bank`), Obsidian-default, and provenance-honest.
+Migration from the old whole-note command retains command compatibility but
+**does not auto-re-promote legacy notes**. **Rollback:** set
+`document_retrieval_enabled: false` in plugin config (Memory Bank untouched);
+tables carry `deletion_protection` + `prevent_destroy` and are removed only with
+explicit approval.
+
+**GenAI credit eligibility must be checked in GCP Billing** — not asserted here.
+
+→ **Full operations guide:** [`docs/semantic-ingestion.md`](docs/semantic-ingestion.md)
+(architecture, source policy, cost reporting, rollback, troubleshooting, limitations).
 
 ## Cost notes
 
 - Memory Bank: **$0.25 / 1,000 stored memories** (generation billed as Gemini + embeddings)
 - BigQuery: on-demand $6.25/TB scanned, storage $0.02/GB/mo — dataset is tiny (<100 MB)
-- Generation model: `gemini-2.5-flash` (configurable), Embedding: `text-embedding-005`
+- Generation model: `gemini-2.5-flash` (configurable), Memory embedding: `text-embedding-005`
+- Document embedding: `gemini-embedding-001` @768 dims — rough per-run estimate printed by ingest (`cost_estimate=$…`, ~$0.15/1M tokens); estimate only, verify credits in Billing
 
 ## Hermes bridge
 
@@ -102,7 +139,8 @@ cd terraform && terraform init && terraform apply -var="project_id=$PROJECT_ID"
 ```
 src/hermes_memory/  — pip package
 bigquery/           — DDL (dataset, tables, views)
-terraform/          — infra-as-code
+docs/               — semantic-ingestion.md (ingestion ops guide)
+terraform/          — infra-as-code (document tables: deletion_protection + prevent_destroy)
 scripts/setup.sh    — idempotent gcloud/bq bootstrap
 examples/           — demo.py (mock), adk_agent_example.py
 tests/              — import + schema tests
