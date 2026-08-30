@@ -166,91 +166,388 @@ def seed(user_id, agent_name, dry_run):
     )
 
 
+def _dry_run_state_reader(source_id, *, user_id, agent_name):
+    """Preview-safe state reader: reports no prior state, touching no network.
+
+    A dry run never queries BigQuery ``document_sources``; it presents the full
+    plan as if nothing were previously ingested. This keeps the preview honest
+    (it never claims a skip it did not verify) while constructing no client.
+    """
+    return None
+
+
+# --- Apply-time dependency seams --------------------------------------------
+#
+# Each seam constructs exactly one real cloud dependency and is only ever called
+# on an ``--apply`` run. Tests monkeypatch these to inject fakes, so a dry run
+# (which never calls any seam) constructs no client and makes no network call.
+
+
+def _build_embedding_client(cfg):
+    from google import genai
+
+    from .embeddings import VertexEmbeddingClient
+
+    sdk_client = genai.Client(vertexai=True, project=cfg.project, location=cfg.location)
+    return VertexEmbeddingClient(
+        client=sdk_client,
+        model=cfg.document_embedding_model,
+        dimensions=cfg.document_embedding_dimensions,
+        task_type="RETRIEVAL_DOCUMENT",
+    )
+
+
+def _build_state_reader(cfg):
+    from . import bigquery_store
+
+    def reader(source_id, *, user_id, agent_name):
+        return bigquery_store.get_source_state(
+            source_id, user_id=user_id, agent_name=agent_name, cfg=cfg
+        )
+
+    return reader
+
+
+def _build_insert_chunks(cfg):
+    from . import bigquery_store
+
+    return bigquery_store.insert_chunks
+
+
+def _build_finalize_source_revision(cfg):
+    from . import bigquery_store
+
+    return bigquery_store.finalize_source_revision
+
+
+def _build_semantic_gateway(cfg):
+    # No semantic boundary gateway wired for the personal CLI yet; structural
+    # chunks are used as-is. Returning None keeps apply on the deterministic path.
+    return None
+
+
+def _build_memory_bank(cfg):
+    from .hermes_bridge import HermesBridge
+    from .memory_bank import generate_from_contents
+
+    bridge = HermesBridge()
+    return generate_from_contents, bridge.memory_bank_name
+
+
+def _deactivate_missing_sources(
+    corpus_id, seen_source_ids, *, user_id, agent_name, prune, limited, cfg
+):
+    from . import bigquery_store
+
+    bigquery_store.deactivate_missing_sources(
+        corpus_id,
+        seen_source_ids,
+        user_id=user_id,
+        agent_name=agent_name,
+        prune=prune,
+        limited=limited,
+        cfg=cfg,
+    )
+
+
+def _sorted_sources(sources):
+    return sorted(sources, key=lambda s: s.relative_path)
+
+
+def _sorted_rejected(rejected):
+    return sorted(rejected, key=lambda r: (r.path, r.rule))
+
+
+def _plan_payload(plan, *, mode, user_id, agent_name):
+    """Build the deterministic, body-free serializable view of a plan."""
+    return {
+        "mode": mode,
+        "user_id": user_id,
+        "agent_name": agent_name,
+        "counts": {
+            "discovered": len(plan.discovered),
+            "skipped": len(plan.skipped),
+            "rejected": len(plan.rejected),
+            "chunks": plan.chunk_count,
+            "requests": plan.request_count,
+            "tokens": plan.token_count,
+        },
+        "cost_estimate": plan.cost_estimate,
+        "discovered": [
+            {
+                "relative_path": s.relative_path,
+                "status": s.status,
+                "chunk_count": s.chunk_count,
+                "token_count": s.token_count,
+            }
+            for s in _sorted_sources(plan.discovered)
+        ],
+        "skipped": [
+            {
+                "relative_path": s.relative_path,
+                "status": s.status,
+                "chunk_count": s.chunk_count,
+                "token_count": s.token_count,
+            }
+            for s in _sorted_sources(plan.skipped)
+        ],
+        "rejected": [{"path": r.path, "rule": r.rule} for r in _sorted_rejected(plan.rejected)],
+    }
+
+
+def _render_plan(plan, *, mode, user_id, agent_name):
+    """Render a deterministic, body-free plan table (never prints note bodies)."""
+    lines: list[str] = []
+    lines.append(f"Obsidian ingestion {mode} — user_id={user_id} agent_name={agent_name}")
+    if mode == "preview":
+        lines.append("(dry run: no BigQuery/Vertex/Memory Bank client constructed; no writes)")
+    lines.append(
+        f"discovered={len(plan.discovered)} skipped={len(plan.skipped)} "
+        f"rejected={len(plan.rejected)}"
+    )
+    lines.append(
+        f"chunks={plan.chunk_count} requests={plan.request_count} "
+        f"tokens={plan.token_count} cost_estimate=${plan.cost_estimate:.6f}"
+    )
+    if plan.discovered:
+        lines.append("discovered sources:")
+        for s in _sorted_sources(plan.discovered):
+            lines.append(
+                f"  [{s.status}] {s.relative_path} (chunks={s.chunk_count}, tokens={s.token_count})"
+            )
+    if plan.skipped:
+        lines.append("skipped sources:")
+        for s in _sorted_sources(plan.skipped):
+            lines.append(f"  [skipped] {s.relative_path}")
+    if plan.rejected:
+        lines.append("rejected sources:")
+        for r in _sorted_rejected(plan.rejected):
+            lines.append(f"  [rejected:{r.rule}] {r.path}")
+    return "\n".join(lines)
+
+
+def _limit_plan(plan, limit):
+    """Return a new plan capping discovered sources to the first ``limit``.
+
+    Sources are ordered deterministically by relative_path before truncation so
+    a limited run is reproducible. Skipped/rejected are preserved untouched.
+    """
+    from .ingestion import IngestionPlan, _cost_estimate
+
+    if limit is None or limit >= len(plan.discovered):
+        return plan
+    kept = tuple(_sorted_sources(plan.discovered)[:limit])
+    chunk_count = sum(s.chunk_count for s in kept)
+    token_count = sum(s.token_count for s in kept)
+    return IngestionPlan(
+        discovered=kept,
+        skipped=plan.skipped,
+        rejected=plan.rejected,
+        chunk_count=chunk_count,
+        request_count=chunk_count,
+        token_count=token_count,
+        cost_estimate=_cost_estimate(token_count),
+    )
+
+
+def _report_payload(report, *, user_id, agent_name):
+    """Deterministic, body-free serializable view of an apply report."""
+    return {
+        "mode": "apply",
+        "user_id": user_id,
+        "agent_name": agent_name,
+        "counts": {
+            "written": len(report.discovered),
+            "skipped": len(report.skipped),
+            "rejected": len(report.rejected),
+            "chunks": report.chunk_count,
+            "requests": report.request_count,
+            "tokens": report.token_count,
+        },
+        "cost_estimate": report.cost_estimate,
+        "promotion_status": report.promotion_status,
+        "written": [
+            {
+                "relative_path": o.relative_path,
+                "status": o.status,
+                "chunk_count": o.chunk_count,
+                "token_count": o.token_count,
+            }
+            for o in sorted(report.discovered, key=lambda o: o.relative_path)
+        ],
+        "skipped": [
+            {"relative_path": o.relative_path, "status": o.status}
+            for o in sorted(report.skipped, key=lambda o: o.relative_path)
+        ],
+        "rejected": [{"path": r.path, "rule": r.rule} for r in _sorted_rejected(report.rejected)],
+    }
+
+
+def _render_report(report, *, user_id, agent_name):
+    """Render a deterministic, body-free apply report (never prints bodies)."""
+    lines: list[str] = []
+    lines.append(f"Obsidian ingestion applied — user_id={user_id} agent_name={agent_name}")
+    lines.append(
+        f"written={len(report.discovered)} skipped={len(report.skipped)} "
+        f"rejected={len(report.rejected)}"
+    )
+    lines.append(
+        f"chunks={report.chunk_count} requests={report.request_count} "
+        f"tokens={report.token_count} cost_estimate=${report.cost_estimate:.6f}"
+    )
+    lines.append(f"promotion_status={report.promotion_status}")
+    if report.discovered:
+        lines.append("written sources:")
+        for o in sorted(report.discovered, key=lambda o: o.relative_path):
+            lines.append(
+                f"  [{o.status}] {o.relative_path} (chunks={o.chunk_count}, tokens={o.token_count})"
+            )
+    return "\n".join(lines)
+
+
 @main.command("ingest-obsidian")
 @click.option("--user", "user_id", required=True, help="user_id scope")
 @click.option("--agent", "agent_name", default="hermes", help="agent_name scope")
 @click.option(
-    "--vault", "vaults", multiple=True, help="Vault path(s); repeatable. Default = canonical set"
+    "--vault",
+    "vaults",
+    multiple=True,
+    help="Vault path to ingest (allowlist). Repeatable; at least one is REQUIRED.",
 )
 @click.option(
-    "--min-chars",
-    default=200,
+    "--limit",
+    default=None,
     type=int,
-    help="Skip notes shorter than this after stripping frontmatter",
+    help="Cap the number of new/changed sources processed on an --apply run.",
+)
+@click.option("--apply", "apply_writes", is_flag=True, help="Perform writes (required to write).")
+@click.option(
+    "--promote-to-memory-bank",
+    "promote",
+    is_flag=True,
+    help="Also extract facts into Memory Bank (requires --apply).",
 )
 @click.option(
-    "--batch-chars", default=6000, type=int, help="Approx chars per Memory Bank generate() call"
+    "--prune",
+    is_flag=True,
+    help="Deactivate sources absent from the vault (requires --apply; not with --limit).",
 )
+@click.option("--json", "as_json", is_flag=True, help="Emit the plan/report as deterministic JSON.")
 @click.option(
-    "--limit", default=None, type=int, help="Cap number of new/changed notes processed (testing)"
+    "--batch-chars",
+    default=None,
+    type=int,
+    help="DEPRECATED and ignored — semantic chunking replaces manual batching.",
 )
-@click.option("--dry-run", is_flag=True, help="Preview batches without writing")
-def ingest_obsidian(user_id, agent_name, vaults, min_chars, batch_chars, limit, dry_run):
-    """Ingest Obsidian vault notes into Memory Bank via real Gemini extraction (deduped by content hash)."""
-    from .hermes_bridge import (
-        DEFAULT_OBSIDIAN_VAULTS,
-        batch_notes,
-        discover_obsidian_notes,
-        _load_obsidian_manifest,
-        _save_obsidian_manifest,
-    )
-    from .memory_bank import generate_from_contents
+def ingest_obsidian(
+    user_id, agent_name, vaults, limit, apply_writes, promote, prune, as_json, batch_chars
+):
+    """Preview or apply semantic ingestion of allow-listed Obsidian vaults.
 
-    vault_list = list(vaults) if vaults else DEFAULT_OBSIDIAN_VAULTS
-    click.echo("Scanning vaults:\n  " + "\n  ".join(vault_list))
-    notes = discover_obsidian_notes(vault_list, min_chars=min_chars)
-    click.echo(
-        f"Found {len(notes)} substantive notes (>= {min_chars} chars, config/trash dirs excluded)"
-    )
+    Preview-first: with no ``--apply`` this only plans and prints what *would*
+    be written, constructing no client and making no network call. ``--apply``
+    performs the writes; fact extraction requires a separate explicit
+    ``--promote-to-memory-bank``.
+    """
+    from . import ingestion
+    from .config import load_config
 
-    manifest = _load_obsidian_manifest()
-    new_notes = [n for n in notes if manifest.get(n["path"]) != n["hash"]]
-    click.echo(
-        f"{len(new_notes)} new/changed, {len(notes) - len(new_notes)} already ingested (unchanged)"
-    )
+    if batch_chars is not None:
+        click.echo(
+            "warning: --batch-chars is deprecated and ignored; semantic chunking "
+            "replaces manual batching.",
+            err=True,
+        )
 
-    if limit:
-        new_notes = new_notes[:limit]
-        click.echo(f"Limiting this run to first {limit} notes")
+    vault_list = [v for v in vaults if v and v.strip()]
+    if not vault_list:
+        raise click.UsageError(
+            "at least one --vault is required (no default vault allowlist); "
+            "pass --vault PATH for each vault to ingest."
+        )
 
-    batches = batch_notes(new_notes, batch_chars=batch_chars)
-    click.echo(
-        f"Grouped into {len(batches)} batch(es) (~{batch_chars} chars each -> ~{len(batches)} Memory Bank generate calls)"
-    )
+    if promote and not apply_writes:
+        raise click.UsageError("--promote-to-memory-bank requires --apply (it performs writes).")
+    if prune and not apply_writes:
+        raise click.UsageError("--prune requires --apply (it deactivates sources).")
+    if prune and limit is not None:
+        raise click.UsageError(
+            "--prune cannot be combined with --limit: a limited run sees only part of "
+            "the vault and must not deactivate the sources it did not examine."
+        )
 
-    if dry_run:
-        for i, b in enumerate(batches):
-            click.echo(
-                f"  [dry-run] batch {i + 1}/{len(batches)}: {len(b)} notes -> {[n['rel'] for n in b]}"
-            )
+    cfg = load_config()
+
+    if not apply_writes:
+        # Preview: no seam is called, so no client is constructed and no network
+        # call is made. State is read through the preview-safe reader only.
+        plan = ingestion.plan_obsidian_ingestion(
+            vault_list,
+            cfg=cfg,
+            user_id=user_id,
+            agent_name=agent_name,
+            state_reader=_dry_run_state_reader,
+        )
+        if as_json:
+            payload = _plan_payload(plan, mode="preview", user_id=user_id, agent_name=agent_name)
+            click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            click.echo(_render_plan(plan, mode="preview", user_id=user_id, agent_name=agent_name))
         return
 
-    bridge = HermesBridge()
-    scope = {"user_id": user_id, "agent_name": agent_name}
-    ingested_notes = 0
-    failed_batches = 0
-    for i, b in enumerate(batches):
-        texts = [
-            f"## {n['rel']} (vault: {__import__('pathlib').Path(n['vault']).name})\n\n{n['body']}"
-            for n in b
-        ]
-        try:
-            generate_from_contents(bridge.memory_bank_name, texts, scope, cfg=bridge.cfg)
-            for n in b:
-                manifest[n["path"]] = n["hash"]
-            ingested_notes += len(b)
-            click.echo(f"  [OK] batch {i + 1}/{len(batches)}: {len(b)} notes")
-        except Exception as e:
-            failed_batches += 1
-            click.echo(f"  [FAIL] batch {i + 1}/{len(batches)}: {e}")
-        _save_obsidian_manifest(
-            manifest
-        )  # save progress after every batch so interrupts don't lose state
-
-    click.echo(
-        f"\nIngested {ingested_notes}/{len(new_notes)} notes across {len(batches) - failed_batches}/{len(batches)} "
-        f"successful batches for scope user_id={user_id}, agent_name={agent_name}"
+    # --- apply path: real dependencies built through injectable seams ---------
+    state_reader = _build_state_reader(cfg)
+    plan = ingestion.plan_obsidian_ingestion(
+        vault_list,
+        cfg=cfg,
+        user_id=user_id,
+        agent_name=agent_name,
+        state_reader=state_reader,
     )
+    limited = limit is not None
+    plan = _limit_plan(plan, limit)
+
+    memory_bank_client = None
+    memory_bank_name = None
+    if promote:
+        memory_bank_client, memory_bank_name = _build_memory_bank(cfg)
+
+    report = ingestion.apply_ingestion_plan(
+        plan,
+        cfg=cfg,
+        user_id=user_id,
+        agent_name=agent_name,
+        embedding_client=_build_embedding_client(cfg),
+        insert_chunks=_build_insert_chunks(cfg),
+        finalize_source_revision=_build_finalize_source_revision(cfg),
+        semantic_gateway=_build_semantic_gateway(cfg),
+        memory_bank_client=memory_bank_client,
+        promote_to_memory_bank=promote,
+        memory_bank_name=memory_bank_name,
+    )
+
+    if prune:
+        # Deactivate sources absent from the vault, per corpus. Only reachable
+        # with an explicit --prune on a non-limited run (guarded above).
+        by_corpus: dict[str, list[str]] = {}
+        for planned in (*plan.discovered, *plan.skipped):
+            by_corpus.setdefault(planned.corpus_id, []).append(planned.source_id)
+        for corpus_id, seen in by_corpus.items():
+            _deactivate_missing_sources(
+                corpus_id,
+                seen,
+                user_id=user_id,
+                agent_name=agent_name,
+                prune=True,
+                limited=limited,
+                cfg=cfg,
+            )
+
+    if as_json:
+        payload = _report_payload(report, user_id=user_id, agent_name=agent_name)
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        click.echo(_render_report(report, user_id=user_id, agent_name=agent_name))
 
 
 if __name__ == "__main__":
