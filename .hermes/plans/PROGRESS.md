@@ -52,6 +52,22 @@ real APPROVE — no self-approval, no merge on green CI alone.
   independently reviewed first. Task 21 release tag still requires a separate
   explicit go-ahead. Confirm exact commands at the moment of each billed/
   irreversible step before running it.
+- 2026-08-30: Offline build COMPLETE (Tasks 1-19 integrated @ a6f56f5, 716
+  tests). Pilot scope decisions: (a) RETRIEVAL-ONLY first pilot — NO Memory
+  Bank promotion this round (promote in a later run); (b) NO gateway restart —
+  verify document retrieval out-of-process via `search-docs` against live
+  BigQuery; (c) user gave go to begin, confirming each billed step.
+- 2026-08-30: TASK 20 LIVE PILOT SUCCEEDED (retrieval-only, no restart).
+  Two live-only bugs (mocks missed) found + fixed via TDD during the pilot:
+  (1) insert_chunks passed metadata dict raw to streaming insert -> "metadata
+  is not a record"; (2) streaming-buffer rows block finalize's UPDATE
+  activation. Fix: write chunks via load_table_from_json (managed storage,
+  dict JSON) — commit f1daf6f. Chose Option B for DDL: created only
+  document_sources + document_chunks via `bq mk` (never touched live
+  memories/sessions). Verified live: 17 chunks + 2 sources active, 768-dim
+  embeddings, `search-docs` returns ranked COSINE results with line-anchored
+  citations. Total spend ~$0.0015. Pilot artifacts: BigQuery tables live;
+  pilot vault ~/Vaults/_pilot_hermes_docs (2 approved notes, copies).
 
 ## Integration reconciliation clusters
 - **Chunking:** Tasks 4 (integrated) / 6 / 14 — cherry-pick only the isolated
