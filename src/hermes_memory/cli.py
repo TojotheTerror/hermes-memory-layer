@@ -1,7 +1,10 @@
 """CLI: hermes-memory init | search | remember | stats | sync"""
+
 from __future__ import annotations
 
 import json
+from pathlib import Path
+
 import click
 
 from .config import load_config
@@ -21,11 +24,44 @@ def main():
 def init(project, location, bq_location):
     """Create BigQuery dataset + tables + views (idempotent)."""
     cfg = load_config(project=project, location=location, bq_location=bq_location)
-    click.echo(f"Project: {cfg.project}  Location: {cfg.location}  BQ: {cfg.bq_location}  Dataset: {cfg.bq_dataset}")
+    click.echo(
+        f"Project: {cfg.project}  Location: {cfg.location}  BQ: {cfg.bq_location}  Dataset: {cfg.bq_dataset}"
+    )
     from .bigquery_store import ensure_dataset, ensure_tables
+
     ensure_dataset(cfg)
     ensure_tables(cfg)
-    click.echo("Init done. Next: create a Memory Bank with python -c \"from hermes_memory.memory_bank import create_memory_bank; print(create_memory_bank())\"")
+    click.echo(
+        'Init done. Next: create a Memory Bank with python -c "from hermes_memory.memory_bank import create_memory_bank; print(create_memory_bank())"'
+    )
+
+
+@main.command("evaluate-docs")
+@click.option(
+    "--queries",
+    "queries_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--json",
+    "json_path",
+    required=True,
+    type=click.Path(dir_okay=False, path_type=Path),
+)
+def evaluate_docs(queries_path: Path, json_path: Path):
+    """Measure document retrieval against the initial pilot gates."""
+    from . import evaluation
+
+    try:
+        queries = evaluation.load_queries(queries_path)
+        execute_search = evaluation.make_runtime_query_executor()
+        report = evaluation.evaluate_queries(queries, execute_search)
+        evaluation.write_report_json(report, json_path)
+    except Exception:
+        raise click.ClickException("document evaluation failed") from None
+    if not report.pilot_gate.passed:
+        raise click.exceptions.Exit(1)
 
 
 @main.command()
@@ -57,6 +93,7 @@ def remember(user_id, fact):
 def stats(user_id):
     """Show memory stats from BigQuery."""
     from .bigquery_store import fetch_stats
+
     rows = fetch_stats(user_id=user_id)
     click.echo(json.dumps(rows, indent=2, default=str))
 
@@ -66,6 +103,7 @@ def stats(user_id):
 def sync_local(limit):
     """Preview local Hermes SQLite memories (no cloud write)."""
     from .hermes_bridge import read_local_memories
+
     rows = read_local_memories(limit=limit)
     click.echo(json.dumps(rows, indent=2, default=str))
     click.echo(f"\nFound {len(rows)} local memories.")
@@ -97,11 +135,15 @@ def seed(user_id, agent_name, dry_run):
         click.echo(f"[seed] warn: could not fetch existing facts for dedupe: {e}")
 
     new_facts = [f for f in facts if f["fact"].strip().lower() not in existing]
-    click.echo(f"{len(new_facts)} new (not already in corpus), {len(facts) - len(new_facts)} already present")
+    click.echo(
+        f"{len(new_facts)} new (not already in corpus), {len(facts) - len(new_facts)} already present"
+    )
 
     if dry_run:
         for f in new_facts:
-            click.echo(f"  [dry-run] would write ({f['kind']} / {f['source_file']}): {f['fact'][:80]}...")
+            click.echo(
+                f"  [dry-run] would write ({f['kind']} / {f['source_file']}): {f['fact'][:80]}..."
+            )
         return
 
     written = 0
@@ -119,16 +161,29 @@ def seed(user_id, agent_name, dry_run):
             written += 1
             click.echo(f"  [OK] {f['fact'][:60]}...")
 
-    click.echo(f"\nSeeded {written}/{len(new_facts)} new facts for scope user_id={user_id}, agent_name={agent_name}")
+    click.echo(
+        f"\nSeeded {written}/{len(new_facts)} new facts for scope user_id={user_id}, agent_name={agent_name}"
+    )
 
 
 @main.command("ingest-obsidian")
 @click.option("--user", "user_id", required=True, help="user_id scope")
 @click.option("--agent", "agent_name", default="hermes", help="agent_name scope")
-@click.option("--vault", "vaults", multiple=True, help="Vault path(s); repeatable. Default = canonical set")
-@click.option("--min-chars", default=200, type=int, help="Skip notes shorter than this after stripping frontmatter")
-@click.option("--batch-chars", default=6000, type=int, help="Approx chars per Memory Bank generate() call")
-@click.option("--limit", default=None, type=int, help="Cap number of new/changed notes processed (testing)")
+@click.option(
+    "--vault", "vaults", multiple=True, help="Vault path(s); repeatable. Default = canonical set"
+)
+@click.option(
+    "--min-chars",
+    default=200,
+    type=int,
+    help="Skip notes shorter than this after stripping frontmatter",
+)
+@click.option(
+    "--batch-chars", default=6000, type=int, help="Approx chars per Memory Bank generate() call"
+)
+@click.option(
+    "--limit", default=None, type=int, help="Cap number of new/changed notes processed (testing)"
+)
 @click.option("--dry-run", is_flag=True, help="Preview batches without writing")
 def ingest_obsidian(user_id, agent_name, vaults, min_chars, batch_chars, limit, dry_run):
     """Ingest Obsidian vault notes into Memory Bank via real Gemini extraction (deduped by content hash)."""
@@ -142,24 +197,32 @@ def ingest_obsidian(user_id, agent_name, vaults, min_chars, batch_chars, limit, 
     from .memory_bank import generate_from_contents
 
     vault_list = list(vaults) if vaults else DEFAULT_OBSIDIAN_VAULTS
-    click.echo(f"Scanning vaults:\n  " + "\n  ".join(vault_list))
+    click.echo("Scanning vaults:\n  " + "\n  ".join(vault_list))
     notes = discover_obsidian_notes(vault_list, min_chars=min_chars)
-    click.echo(f"Found {len(notes)} substantive notes (>= {min_chars} chars, config/trash dirs excluded)")
+    click.echo(
+        f"Found {len(notes)} substantive notes (>= {min_chars} chars, config/trash dirs excluded)"
+    )
 
     manifest = _load_obsidian_manifest()
     new_notes = [n for n in notes if manifest.get(n["path"]) != n["hash"]]
-    click.echo(f"{len(new_notes)} new/changed, {len(notes) - len(new_notes)} already ingested (unchanged)")
+    click.echo(
+        f"{len(new_notes)} new/changed, {len(notes) - len(new_notes)} already ingested (unchanged)"
+    )
 
     if limit:
         new_notes = new_notes[:limit]
         click.echo(f"Limiting this run to first {limit} notes")
 
     batches = batch_notes(new_notes, batch_chars=batch_chars)
-    click.echo(f"Grouped into {len(batches)} batch(es) (~{batch_chars} chars each -> ~{len(batches)} Memory Bank generate calls)")
+    click.echo(
+        f"Grouped into {len(batches)} batch(es) (~{batch_chars} chars each -> ~{len(batches)} Memory Bank generate calls)"
+    )
 
     if dry_run:
         for i, b in enumerate(batches):
-            click.echo(f"  [dry-run] batch {i + 1}/{len(batches)}: {len(b)} notes -> {[n['rel'] for n in b]}")
+            click.echo(
+                f"  [dry-run] batch {i + 1}/{len(batches)}: {len(b)} notes -> {[n['rel'] for n in b]}"
+            )
         return
 
     bridge = HermesBridge()
@@ -167,7 +230,10 @@ def ingest_obsidian(user_id, agent_name, vaults, min_chars, batch_chars, limit, 
     ingested_notes = 0
     failed_batches = 0
     for i, b in enumerate(batches):
-        texts = [f"## {n['rel']} (vault: {__import__('pathlib').Path(n['vault']).name})\n\n{n['body']}" for n in b]
+        texts = [
+            f"## {n['rel']} (vault: {__import__('pathlib').Path(n['vault']).name})\n\n{n['body']}"
+            for n in b
+        ]
         try:
             generate_from_contents(bridge.memory_bank_name, texts, scope, cfg=bridge.cfg)
             for n in b:
@@ -177,7 +243,9 @@ def ingest_obsidian(user_id, agent_name, vaults, min_chars, batch_chars, limit, 
         except Exception as e:
             failed_batches += 1
             click.echo(f"  [FAIL] batch {i + 1}/{len(batches)}: {e}")
-        _save_obsidian_manifest(manifest)  # save progress after every batch so interrupts don't lose state
+        _save_obsidian_manifest(
+            manifest
+        )  # save progress after every batch so interrupts don't lose state
 
     click.echo(
         f"\nIngested {ingested_notes}/{len(new_notes)} notes across {len(batches) - failed_batches}/{len(batches)} "
